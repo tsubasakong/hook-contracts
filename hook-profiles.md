@@ -154,3 +154,15 @@ A two‑phase hook can:
     - a pure policy hook (Profile A), or
     - an advanced escrow/settlement hook (Profile B) with clearly defined token flows.
 
+### Example: Underwriter-gated completion with optional follow-on close job
+
+- Example implementation: `contracts/hooks/UnderwritingHook.sol`
+- Uses the standard ACP lifecycle for every job; it does **not** extend the core with a separate open-job entrypoint.
+- Requires the hook itself to act as both the ACP hook and evaluator contract for underwritten jobs.
+- Stores immutable underwriting commits at `setBudget(...)`, validates submit-time evidence, and relays EIP-712 underwriter decisions through `completeBySig(...)` / `rejectBySig(...)`.
+- Supports both:
+  - a single-stage underwritten job, and
+  - a parent job that may later admit one hook-linked follow-on close job.
+- Keeps `AwaitingClose` and parent/close linkage entirely inside hook state instead of extending the shared ACP core.
+- Omits coordinator, collateral, dispute, and settlement sidecars from the larger MCU prototype; treat it as an experimental policy example, not production settlement infrastructure.
+

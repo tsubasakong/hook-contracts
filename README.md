@@ -20,6 +20,7 @@
 |----------|---------|-------------|
 | [BiddingHook.sol](./contracts/hooks/BiddingHook.sol) | A — Simple Policy | Off-chain signed bidding for provider selection. Providers sign bid commitments; the hook verifies the winning signature on-chain via `setProvider`. Zero direct external calls — everything flows through core → hook callbacks. |
 | [FundTransferHook.sol](./contracts/hooks/FundTransferHook.sol) | B — Advanced Escrow | Two-phase fund transfer for token conversion/bridging jobs. Client capital flows to provider at `fund`; provider deposits output tokens at `submit`; buyer receives them at `complete`. |
+| [UnderwritingHook.sol](./contracts/hooks/UnderwritingHook.sol) | C — Experimental | Underwriter-signed job approval with immutable underwriting commits and an optional hook-linked follow-on close job, all on the unchanged ACP lifecycle. |
 
 ## Building a Hook
 

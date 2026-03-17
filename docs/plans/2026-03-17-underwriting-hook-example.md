@@ -2,140 +2,128 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add a minimal-core underwriting example to `hook-contracts` that demonstrates underwriter-gated admission and finalization, including an optional two-stage open/close flow whose lineage stays in the hook rather than the core.
+**Goal:** Add a concise underwriting example to `hook-contracts` that supports underwriter-signed single-stage jobs and an optional hook-linked follow-on close job without changing `AgenticCommerceHooked`.
 
-**Architecture:** Keep this example much smaller than the MCU prototype. Do not port `MCUCoordinator`, `MCUSettlementEscrow`, collateral locking, dispute windows, or slash settlement. Add only the smallest core extension needed to represent an open-stage job, then keep parent/close linkage, active close exclusivity, underwriter registry, evidence matching, and open-to-close gating inside the hook and evaluator.
+**Architecture:** Keep `contracts/AgenticCommerceHooked.sol` untouched and preserve the standard ACP lifecycle for every job. Implement a single `contracts/hooks/UnderwritingHook.sol` contract that inherits `BaseACPHook` and also serves as the ACP evaluator for those jobs via `completeBySig()` and `rejectBySig()`. Track parent/close linkage and one extra hook-specific phase bit (`AwaitingClose`) entirely inside the hook; do not port MCU coordinator, escrow, collateral, or dispute logic.
 
-**Tech Stack:** Solidity `^0.8.20`, `AgenticCommerceHooked`, `BaseACPHook`, OpenZeppelin `EIP712` + `ECDSA`, Foundry.
+**Tech Stack:** Solidity `^0.8.20`, Foundry, `forge-std`, OpenZeppelin `ECDSA` + `EIP712`, `AgenticCommerceHooked`, `BaseACPHook`.
 
 ---
 
-## Design Rules
+## Scope Guardrails
 
-- Preserve current `createJob()` behavior for all existing hooks.
-- Do not add a native core `Close` job type in v1.
-- Do not add parent/close lineage mappings to the core in v1.
-- Keep refund semantics unchanged: `claimRefund()` stays non-hookable.
-- Keep underwriting settlement out of scope: no coordinator, no sidecar escrow, no collateral manager integration.
-- Treat the example as **Profile C / Experimental** because it changes lifecycle shape and depends on off-chain underwriter signatures.
+- Do not modify `contracts/AgenticCommerceHooked.sol`.
+- Do not add `createOpenJob`, `JobKind`, or native parent/close getters to the core.
+- Do not create a separate `UnderwriterDecisionEvaluator.sol`.
+- Every underwritten job must use the existing ACP rail: `createJob -> setBudget -> fund -> submit -> complete/reject`.
+- The hook contract itself must be passed as both `hook` and `evaluator` at job creation time.
+- Keep refund semantics unchanged: `claimRefund()` remains non-hookable.
+- Keep settlement, collateral, and dispute logic out of scope.
+- Treat the example as `Profile C - Experimental`.
 
-## Current Baseline
+## Flow Summary
 
-- `BaseACPHook` already dispatches `fund(uint256,uint256,bytes)` correctly.
-- `test/BaseACPHookFundDispatch.t.sol` is the regression guard for fund hook routing.
-- This plan assumes that selector fix stays in place.
+### Single-stage
+
+```text
+client
+  -> createJob(provider, evaluator=hook, hook=hook)
+  -> setBudget(jobId, fee, abi.encode(commit{parentJobId=0, allowCloseJob=false}))
+  -> fund(jobId, fee, "")
+provider
+  -> submit(jobId, bundleHash, abi.encode(evidence))
+underwriter
+  -> sign CompleteDecision or RejectDecision
+caller
+  -> hook.completeBySig(...) or hook.rejectBySig(...)
+hook/evaluator
+  -> acp.complete(...) or acp.reject(...)
+```
+
+### Parent + close
+
+```text
+parent job
+  createJob -> setBudget(commit{parentJobId=0, allowCloseJob=true}) -> fund -> submit -> completeBySig
+  hook marks parent AwaitingClose
+
+close job
+  createJob -> setBudget(commit{parentJobId=parentJobId, allowCloseJob=false}) -> fund -> submit -> completeBySig/rejectBySig
+  hook clears linkage on success, and clears only the active close slot on reject/expiry
+```
 
 ## Proposed Contract Shape
 
-### Minimal Core Additions
+### `contracts/hooks/UnderwritingHook.sol`
 
-Modify `contracts/AgenticCommerceHooked.sol` only enough to support an open-stage underwriting leg:
+Responsibilities:
 
-- add `JobKind { Standalone, Open }`
-- add `mapping(uint256 => JobKind) jobKindByJobId`
-- keep `createJob(...)` as the existing standalone path
-- add `createOpenJob(provider, evaluator, expiredAt, description, hook)`
-- add `getJobKind(jobId)`
-- block `submit()` for `JobKind.Open`
-- allow `complete()` on `JobKind.Open` directly from `Funded`
+- inherit `BaseACPHook`
+- store admin and underwriter registry
+- store one immutable underwriting commit per job
+- store the budget committed with the first underwriting commit
+- validate that the first `setBudget()` happens only after `provider` is already set
+- validate that `job.hook == address(this)` and `job.evaluator == address(this)` for underwritten jobs
+- classify jobs from the committed payload:
+  - `SingleStage`: `parentJobId == 0 && allowCloseJob == false`
+  - `ParentStage`: `parentJobId == 0 && allowCloseJob == true`
+  - `CloseStage`: `parentJobId != 0`
+- track hook-only lineage:
+  - `awaitingCloseByJobId[parentJobId]`
+  - `parentJobIdByCloseJobId[closeJobId]`
+  - `activeCloseJobIdByParentJobId[parentJobId]`
+- lazily reclaim a stale close slot when a replacement close job is committed and the old close job is already `Rejected` or `Expired`
+- validate submit evidence against committed `bundleHash`, `policyHash`, and `quoteIdHash`
+- expose evaluator entrypoints:
+  - `completeBySig(CompleteDecision, bytes)`
+  - `rejectBySig(RejectDecision, bytes)`
 
-Do **not** add:
-
-- `JobKind.Close`
-- `createCloseJob(...)`
-- `getParentJobId(...)`
-- `getCloseJobId(...)`
-
-The close leg remains a normal `createJob(...)` call whose hook opt params include `parentJobId`.
-
-### New Example Contracts
-
-- `contracts/hooks/UnderwritingTypes.sol`
-- `contracts/hooks/UnderwritingHook.sol`
-- `contracts/hooks/UnderwriterDecisionEvaluator.sol`
-
-### Hook Data Model
-
-`UnderwritingTypes.sol`
+Minimal data shape:
 
 ```solidity
-library UnderwritingTypes {
-    enum FlowKind {
-        SingleStage,
-        TwoStageOpen,
-        TwoStageClose
-    }
+struct UnderwriteCommit {
+    uint256 parentJobId;
+    address underwriter;
+    uint64 validUntil;
+    bytes32 policyHash;
+    bytes32 quoteIdHash;
+    bytes32 termsHash;
+    bool allowCloseJob;
+}
 
-    enum HookState {
-        None,
-        Committed,
-        Funded,
-        EvidenceSubmitted,
-        AwaitingClose
-    }
+struct SubmitEvidence {
+    bytes32 bundleHash;
+    bytes32 policyHash;
+    bytes32 quoteIdHash;
+}
 
-    struct UnderwriteCommit {
-        uint256 parentJobId;
-        address underwriter;
-        uint64 validUntil;
-        bytes32 policyHash;
-        bytes32 quoteIdHash;
-        bytes32 termsHash;
-    }
+struct CompleteDecision {
+    uint256 jobId;
+    bytes32 reason;
+    uint64 deadline;
+    uint256 nonce;
+}
 
-    struct SubmitEvidence {
-        bytes32 bundleHash;
-        bytes32 policyHash;
-        bytes32 quoteIdHash;
-    }
+struct RejectDecision {
+    uint256 jobId;
+    bytes32 reason;
+    uint64 deadline;
+    uint256 nonce;
 }
 ```
 
-`HookState` intentionally stays small. Core `JobStatus` already tells us whether a job is `Open`, `Funded`, `Submitted`, `Completed`, `Rejected`, or `Expired`; the hook only needs to track underwriting-specific state and whether an open leg is parked in `AwaitingClose`.
+Notes:
 
-### Hook Responsibilities
+- `termsHash` is committed for auditability but does not need a separate submit-time payload in v1.
+- `Committed`, `Funded`, and `EvidenceSubmitted` do not need hook-local enums; ACP `JobStatus` plus successful hook callbacks already cover them.
+- The only extra phase bit this example should own is `AwaitingClose`.
 
-`contracts/hooks/UnderwritingHook.sol`
-
-- inherit `BaseACPHook`
-- keep an `admin` and underwriter registry
-- store one `UnderwriteCommit` per `jobId`
-- resolve `FlowKind` from `(core job kind, commit.parentJobId)`
-- keep hook-managed lineage:
-  - `parentJobIdByCloseJobId`
-  - `activeCloseJobIdByParentJobId`
-- require close jobs to match the parent job on:
-  - client
-  - provider
-  - evaluator
-  - hook
-  - underwriter
-- allow single-stage and open commits only if the chosen underwriter is currently registered
-- allow close commits to reuse the parent underwriter even if that signer was later removed from the registry
-- validate submit evidence against the committed `policyHash` and `quoteIdHash`
-- move open jobs into `AwaitingClose` on successful completion
-- clear active close linkage when a close attempt is rejected or expires
-
-### Evaluator Responsibilities
-
-`contracts/hooks/UnderwriterDecisionEvaluator.sol`
-
-- verify EIP-712 `CompleteDecision` and `RejectDecision` signatures from the committed underwriter
-- check nonce replay protection
-- allow:
-  - `TwoStageOpen` completion/rejection while the core job is still `Funded`
-  - `SingleStage` and `TwoStageClose` completion/rejection only after `Submitted`
-- call core `complete()` / `reject()` after successful signature verification
-
-This keeps the example focused on underwriting approval and evidence validation, not settlement.
-
----
-
-### Task 1: Normalize Foundry Project Setup
+## Task 1: Normalize Foundry Setup
 
 **Files:**
 - Create: `foundry.toml`
 - Create: `lib/openzeppelin-contracts/` via `forge install`
+- Create: `lib/forge-std/` via `forge install`
 - Verify: `test/BaseACPHookFundDispatch.t.sol`
 
 **Step 1: Write the failing build expectation**
@@ -146,9 +134,9 @@ Run:
 forge build
 ```
 
-Expected: FAIL because `@openzeppelin` imports are unresolved in the current repo checkout.
+Expected: FAIL with unresolved `@openzeppelin` imports in the current checkout.
 
-**Step 2: Add minimal Foundry config**
+**Step 2: Add Foundry config**
 
 Create `foundry.toml`:
 
@@ -159,17 +147,22 @@ test = "test"
 out = "out"
 libs = ["lib"]
 solc_version = "0.8.20"
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "forge-std/=lib/forge-std/src/"
+]
 ```
 
-**Step 3: Install OpenZeppelin**
+**Step 3: Install dependencies**
 
 Run:
 
 ```bash
-forge install OpenZeppelin/openzeppelin-contracts
+forge install --no-git OpenZeppelin/openzeppelin-contracts
+forge install --no-git foundry-rs/forge-std
 ```
 
-**Step 4: Re-run the scoped regression test**
+**Step 4: Re-run the existing regression test**
 
 Run:
 
@@ -186,34 +179,54 @@ git add foundry.toml lib/ test/BaseACPHookFundDispatch.t.sol
 git commit -m "chore: set up foundry for hook examples"
 ```
 
-### Task 2: Add Minimal Open-Job Support to the Core
+## Task 2: Add the Hook Contract and Admission Rules
 
 **Files:**
-- Modify: `contracts/AgenticCommerceHooked.sol`
-- Create: `test/AgenticCommerceHookedOpenJobs.t.sol`
+- Create: `contracts/hooks/UnderwritingHook.sol`
+- Create: `test/helpers/UnderwritingHookTestBase.sol`
+- Create: `test/UnderwritingHookAdmission.t.sol`
 
-**Step 1: Write the failing tests**
+**Step 1: Write the failing admission tests**
 
-Create tests covering only the minimal new behavior:
+Create tests for:
+
+- first underwriting commit requires a registered underwriter
+- first underwriting commit requires `provider` already set
+- first underwriting commit requires `job.hook == address(hook)` and `job.evaluator == address(hook)`
+- first commit locks both `amount` and `UnderwriteCommit`
+- same `setBudget()` replay with identical payload is allowed
+- close commit requires parent job to have been committed as `allowCloseJob = true`
+- close commit requires parent job to be `Completed` and hook-marked `AwaitingClose`
+- close commit requires same client, provider, evaluator, and hook as the parent
+- close commit requires same underwriter as the parent
+- second active close job is blocked while the first one is still live
+
+Key test shapes:
 
 ```solidity
-function testCreateOpenJobMarksKindOpen() public {
-    uint256 jobId = acp.createOpenJob(provider, evaluator, block.timestamp + 1 days, "open job", hook);
-    assertEq(uint256(acp.getJobKind(jobId)), uint256(AgenticCommerceHooked.JobKind.Open));
+function testFirstCommitLocksBudgetAndPayload() public {
+    uint256 jobId = _createBaseJob(address(hook), address(hook));
+    UnderwritingHook.UnderwriteCommit memory commit = _singleStageCommit();
+
+    vm.prank(client);
+    acp.setBudget(jobId, 100e6, abi.encode(commit));
+
+    vm.prank(client);
+    vm.expectRevert(UnderwritingHook.CommitLocked.selector);
+    acp.setBudget(jobId, 101e6, abi.encode(commit));
 }
 
-function testOpenJobCannotSubmit() public {
-    uint256 jobId = _createAndFundOpenJob();
-    vm.prank(provider);
-    vm.expectRevert(AgenticCommerceHooked.SubmitNotAllowedForOpenJob.selector);
-    acp.submit(jobId, keccak256("bundle"), "");
-}
+function testCloseCommitStoresParentLinkage() public {
+    uint256 parentJobId = _completeParentStageJob();
 
-function testOpenJobCanCompleteDirectlyFromFunded() public {
-    uint256 jobId = _createAndFundOpenJob();
-    vm.prank(evaluator);
-    acp.complete(jobId, keccak256("ok"), "");
-    assertEq(uint256(acp.getJob(jobId).status), uint256(AgenticCommerceHooked.JobStatus.Completed));
+    uint256 closeJobId = _createBaseJob(address(hook), address(hook));
+    UnderwritingHook.UnderwriteCommit memory closeCommit = _closeStageCommit(parentJobId);
+
+    vm.prank(client);
+    acp.setBudget(closeJobId, 25e6, abi.encode(closeCommit));
+
+    assertEq(hook.getParentJobId(closeJobId), parentJobId);
+    assertEq(hook.getActiveCloseJobId(parentJobId), closeJobId);
 }
 ```
 
@@ -222,160 +235,80 @@ function testOpenJobCanCompleteDirectlyFromFunded() public {
 Run:
 
 ```bash
-forge test --match-path "test/AgenticCommerceHookedOpenJobs.t.sol"
-```
-
-Expected: FAIL because `createOpenJob()` and `getJobKind()` do not exist yet.
-
-**Step 3: Implement the smallest possible core delta**
-
-Modify `contracts/AgenticCommerceHooked.sol`:
-
-- add:
-
-```solidity
-enum JobKind {
-    Standalone,
-    Open
-}
-```
-
-- add:
-
-```solidity
-mapping(uint256 => JobKind) internal jobKindByJobId;
-```
-
-- keep `createJob(...)` as:
-
-```solidity
-jobKindByJobId[jobId] = JobKind.Standalone;
-```
-
-- add:
-
-```solidity
-function createOpenJob(
-    address provider,
-    address evaluator,
-    uint256 expiredAt,
-    string calldata description,
-    address hook
-) external returns (uint256 jobId)
-```
-
-- add:
-
-```solidity
-function getJobKind(uint256 jobId) external view returns (JobKind)
-```
-
-- change `submit()`:
-
-```solidity
-if (jobKindByJobId[jobId] == JobKind.Open) revert SubmitNotAllowedForOpenJob();
-```
-
-- change `complete()`:
-
-```solidity
-if (jobKindByJobId[jobId] == JobKind.Open) {
-    if (job.status != JobStatus.Funded) revert WrongStatus();
-} else {
-    if (job.status != JobStatus.Submitted) revert WrongStatus();
-}
-```
-
-**Step 4: Re-run the open-job tests**
-
-Run:
-
-```bash
-forge test --match-path "test/AgenticCommerceHookedOpenJobs.t.sol"
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add contracts/AgenticCommerceHooked.sol test/AgenticCommerceHookedOpenJobs.t.sol
-git commit -m "feat: add minimal open job support"
-```
-
-### Task 3: Add Underwriting Types and Hook Admission Logic
-
-**Files:**
-- Create: `contracts/hooks/UnderwritingTypes.sol`
-- Create: `contracts/hooks/UnderwritingHook.sol`
-- Create: `test/UnderwritingHookAdmission.t.sol`
-
-**Step 1: Write the failing admission tests**
-
-Create tests for:
-
-- single-stage commit requires a registered underwriter
-- open-job commit resolves to `TwoStageOpen`
-- standalone job with nonzero `parentJobId` resolves to `TwoStageClose`
-- close commit reuses the parent underwriter
-- close commit fails if the parent open leg is not yet `AwaitingClose`
-- close commit fails if another active close job already exists
-
-Key test shape:
-
-```solidity
-function testTwoStageCloseCommitStoresParentLinkage() public {
-    _registerUnderwriter();
-    _commitOpenJob();
-    _markOpenJobAwaitingClose();
-
-    acp.callBeforeAction(address(hook), closeJobId, SEL_SET_BUDGET, _setBudgetData(_closeCommit(openJobId)));
-
-    assertEq(hook.getParentJobId(closeJobId), openJobId);
-    assertEq(hook.getCloseJobId(openJobId), closeJobId);
-    assertEq(uint256(hook.jobFlowKind(closeJobId)), uint256(UnderwritingTypes.FlowKind.TwoStageClose));
-}
-```
-
-**Step 2: Run the failing tests**
-
-Run:
-
-```bash
 forge test --match-path "test/UnderwritingHookAdmission.t.sol"
 ```
 
-Expected: FAIL because the new types and hook do not exist yet.
+Expected: FAIL because `UnderwritingHook.sol` and the test base do not exist yet.
 
-**Step 3: Implement the shared types**
+**Step 3: Create the shared test base**
 
-Create `contracts/hooks/UnderwritingTypes.sol` with:
+Create `test/helpers/UnderwritingHookTestBase.sol` with:
 
-- `FlowKind`
-- `HookState`
-- `UnderwriteCommit`
-- `SubmitEvidence`
+- `forge-std/Test.sol` import
+- a tiny mintable ERC20 test token
+- ACP + hook deployment helpers
+- reusable addresses and private keys for client, provider, underwriter
+- helper methods for:
+  - `_createBaseJob(hook, evaluator)`
+  - `_singleStageCommit()`
+  - `_parentStageCommit()`
+  - `_closeStageCommit(parentJobId)`
+  - `_fundJob(jobId, amount)`
+  - `_submitEvidence(jobId, evidence)`
+  - signing `CompleteDecision` and `RejectDecision`
 
 **Step 4: Implement the admission half of the hook**
 
 Create `contracts/hooks/UnderwritingHook.sol` and implement:
 
-- constructor with `acpContract` and `admin`
-- underwriter registry
-- commit storage keyed by `jobId`
-- flow resolution:
+- constructor: `constructor(address acpContract_, address admin_) BaseACPHook(acpContract_)`
+- admin-gated `registerUnderwriter()` and `unregisterUnderwriter()`
+- view getters:
+  - `getCommit(uint256 jobId)`
+  - `isAwaitingClose(uint256 jobId)`
+  - `getParentJobId(uint256 closeJobId)`
+  - `getActiveCloseJobId(uint256 parentJobId)`
+- `_preSetBudget(...)` to:
+  - decode `UnderwriteCommit`
+  - validate `provider` is already set
+  - validate `job.hook == address(this)` and `job.evaluator == address(this)`
+  - enforce `validUntil > block.timestamp`
+  - classify the flow from `parentJobId` and `allowCloseJob`
+  - register the first commit
+  - on later calls, require exact same `(amount, commit)` or revert
+
+Use this exact shape for the lock check:
 
 ```solidity
-if (jobKind == AgenticCommerceHooked.JobKind.Open) {
-    require(commit.parentJobId == 0, "invalid open commit");
-    return FlowKind.TwoStageOpen;
+bytes32 newCommitHash = keccak256(abi.encode(commit));
+
+if (commitHashByJobId[jobId] == bytes32(0)) {
+    commitHashByJobId[jobId] = newCommitHash;
+    committedBudgetByJobId[jobId] = amount;
+    commits[jobId] = commit;
+} else {
+    if (commitHashByJobId[jobId] != newCommitHash) revert CommitLocked();
+    if (committedBudgetByJobId[jobId] != amount) revert CommitLocked();
+    return;
 }
-if (commit.parentJobId == 0) return FlowKind.SingleStage;
-return FlowKind.TwoStageClose;
 ```
 
-- close-leg validation against the parent job
-- active close tracking in the hook, not the core
+For close-stage validation:
+
+```solidity
+_clearStaleCloseIfTerminal(commit.parentJobId);
+
+if (!awaitingCloseByJobId[commit.parentJobId]) revert ParentNotAwaitingClose();
+if (activeCloseJobIdByParentJobId[commit.parentJobId] != 0) revert ActiveCloseExists();
+if (parentCommit.underwriter != commit.underwriter) revert ParentMismatch();
+```
+
+Then add the actor checks against the parent ACP job:
+
+- same `client`
+- same `provider`
+- same `evaluator`
+- same `hook`
 
 **Step 5: Re-run the admission tests**
 
@@ -390,176 +323,118 @@ Expected: PASS.
 **Step 6: Commit**
 
 ```bash
-git add contracts/hooks/UnderwritingTypes.sol contracts/hooks/UnderwritingHook.sol test/UnderwritingHookAdmission.t.sol
-git commit -m "feat: add underwriting hook admission logic"
+git add contracts/hooks/UnderwritingHook.sol test/helpers/UnderwritingHookTestBase.sol test/UnderwritingHookAdmission.t.sol
+git commit -m "feat: add underwriting hook admission rules"
 ```
 
-### Task 4: Add Hook Lifecycle and Evidence Validation
+## Task 3: Add Submit Validation and Underwriter-Signed Decisions
 
 **Files:**
 - Modify: `contracts/hooks/UnderwritingHook.sol`
-- Create: `test/UnderwritingHookLifecycle.t.sol`
+- Modify: `test/helpers/UnderwritingHookTestBase.sol`
+- Create: `test/UnderwritingHookDecisions.t.sol`
 
-**Step 1: Write the failing lifecycle tests**
-
-Create tests for:
-
-- `fund()` moves hook state from `Committed` to `Funded`
-- open jobs can complete from `Funded` and move to `AwaitingClose`
-- single-stage and close jobs cannot complete until evidence has been submitted
-- `submit()` must match `bundleHash`, `policyHash`, and `quoteIdHash`
-- rejecting an active close job clears the parent-to-close linkage
-- expiring an active close job clears the parent-to-close linkage
-
-Key test shape:
-
-```solidity
-function testOpenJobCompleteTransitionsToAwaitingClose() public {
-    _registerUnderwriter();
-    _commitAndFundOpenJob();
-
-    acp.callAfterAction(openJobId, SEL_COMPLETE, abi.encode(bytes32("ok"), bytes("")));
-
-    assertEq(uint256(hook.jobHookState(openJobId)), uint256(UnderwritingTypes.HookState.AwaitingClose));
-}
-```
-
-**Step 2: Run the lifecycle tests**
-
-Run:
-
-```bash
-forge test --match-path "test/UnderwritingHookLifecycle.t.sol"
-```
-
-Expected: FAIL because the hook has not implemented the lifecycle gates yet.
-
-**Step 3: Implement the minimal lifecycle state machine**
-
-In `contracts/hooks/UnderwritingHook.sol`:
-
-- `_preSetBudget(...)`: decode and validate `UnderwriteCommit`
-- `_preFund(...)`: require a committed profile; require parent open leg is `AwaitingClose` for close jobs
-- `_postFund(...)`: mark hook state `Funded`
-- `_preSubmit(...)`: reject `TwoStageOpen`; require hook state `Funded`
-- `_postSubmit(...)`: decode `SubmitEvidence`; require hashes match the committed profile; mark `EvidenceSubmitted`
-- `_preComplete(...)`:
-  - for `TwoStageOpen`, require hook state `Funded`
-  - otherwise require hook state `EvidenceSubmitted`
-- `_postComplete(...)`:
-  - for `TwoStageOpen`, set `AwaitingClose`
-  - otherwise leave lineage cleared or unchanged
-- `_postReject(...)`: clear active close linkage if this job is a close leg
-- add a direct expiry cleanup method:
-
-```solidity
-function clearExpiredCloseJob(uint256 jobId) external
-```
-
-This method should be permissionless but only succeed if the core job status is `Expired` and the hook flow is `TwoStageClose`.
-
-**Step 4: Re-run the lifecycle tests**
-
-Run:
-
-```bash
-forge test --match-path "test/UnderwritingHookLifecycle.t.sol"
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add contracts/hooks/UnderwritingHook.sol test/UnderwritingHookLifecycle.t.sol
-git commit -m "feat: add underwriting hook lifecycle checks"
-```
-
-### Task 5: Add the Underwriter Signature Evaluator
-
-**Files:**
-- Create: `contracts/hooks/UnderwriterDecisionEvaluator.sol`
-- Create: `test/UnderwriterDecisionEvaluator.t.sol`
-
-**Step 1: Write the failing evaluator tests**
+**Step 1: Write the failing decision/lifecycle tests**
 
 Create tests for:
 
-- open jobs can be completed by signature while the core job is `Funded`
-- open jobs can be rejected by signature while the core job is `Funded`
-- single-stage jobs require `Submitted`
-- close jobs require `Submitted`
+- `submit()` reverts if `SubmitEvidence.bundleHash` does not match `deliverable`
+- `submit()` reverts if `policyHash` or `quoteIdHash` differs from the committed profile
+- `completeBySig()` succeeds for a submitted single-stage job
+- `rejectBySig()` succeeds for a submitted close-stage job
 - invalid signer reverts
 - used nonce reverts
 - expired signature reverts
+- completing a parent-stage job sets `AwaitingClose = true`
+- completing a close-stage job clears:
+  - `activeCloseJobIdByParentJobId[parentJobId]`
+  - `awaitingCloseByJobId[parentJobId]`
+- rejecting a close-stage job clears only the active close slot and leaves the parent in `AwaitingClose`
+- an expired close job can be replaced because stale linkage is cleared lazily on the next close commit
 
-Key test shape:
+Key test shapes:
 
 ```solidity
-function testCompleteBySigAllowsOpenJobsFromFunded() public {
-    _seedOpenJobInFundedState();
-    (decision, sig) = _signedCompleteDecision(openJobId, underwriterPk);
+function testParentStageCompletionMarksAwaitingClose() public {
+    uint256 parentJobId = _createCommittedParentStageJob();
+    _fundJob(parentJobId, 100e6);
+    _submitEvidence(parentJobId, _matchingEvidence());
 
-    evaluator.completeBySig(decision, sig);
+    (UnderwritingHook.CompleteDecision memory decision, bytes memory sig) =
+        _signedCompleteDecision(parentJobId, underwriterPk);
 
-    assertEq(uint256(acp.getJob(openJobId).status), uint256(AgenticCommerceHooked.JobStatus.Completed));
+    hook.completeBySig(decision, sig);
+
+    assertTrue(hook.isAwaitingClose(parentJobId));
+}
+
+function testCloseRejectClearsOnlyActiveCloseSlot() public {
+    uint256 parentJobId = _completeParentStageJob();
+    uint256 closeJobId = _createAndSubmitCloseJob(parentJobId);
+
+    (UnderwritingHook.RejectDecision memory decision, bytes memory sig) =
+        _signedRejectDecision(closeJobId, underwriterPk);
+
+    hook.rejectBySig(decision, sig);
+
+    assertEq(hook.getActiveCloseJobId(parentJobId), 0);
+    assertTrue(hook.isAwaitingClose(parentJobId));
 }
 ```
 
-**Step 2: Run the evaluator tests**
+**Step 2: Run the decision test file**
 
 Run:
 
 ```bash
-forge test --match-path "test/UnderwriterDecisionEvaluator.t.sol"
+forge test --match-path "test/UnderwritingHookDecisions.t.sol"
 ```
 
-Expected: FAIL because the evaluator contract does not exist yet.
+Expected: FAIL because submit-time evidence validation and signature decision methods are not implemented yet.
 
-**Step 3: Implement the evaluator**
+**Step 3: Implement the lifecycle + evaluator half**
 
-Create `contracts/hooks/UnderwriterDecisionEvaluator.sol`:
+In `contracts/hooks/UnderwritingHook.sol` add:
+
+- `_postSubmit(...)` to decode `SubmitEvidence` and require:
+  - `deliverable == evidence.bundleHash`
+  - `evidence.policyHash == commit.policyHash`
+  - `evidence.quoteIdHash == commit.quoteIdHash`
+- `EIP712` domain setup and `ECDSA` recovery
+- `mapping(address => mapping(uint256 => bool)) usedNonces`
+- `completeBySig(...)`
+- `rejectBySig(...)`
+- `_postComplete(...)`:
+  - if `parentJobId == 0 && allowCloseJob == true`, mark `awaitingCloseByJobId[jobId] = true`
+  - if `parentJobId != 0`, clear the parent’s active close slot and set `awaitingCloseByJobId[parentJobId] = false`
+- `_postReject(...)`:
+  - if `parentJobId != 0`, clear only the active close slot
+- `_clearStaleCloseIfTerminal(...)` helper:
+  - if there is no active close job, return
+  - if the current active close job is `Rejected` or `Expired`, delete `activeCloseJobIdByParentJobId[parentJobId]`
+  - do not add a public `clearExpiredCloseJob()` function
+
+Use this exact status check in both decision methods:
 
 ```solidity
-contract UnderwriterDecisionEvaluator is EIP712 {
-    struct CompleteDecision {
-        uint256 jobId;
-        bytes32 reason;
-        uint64 deadline;
-        uint256 nonce;
-    }
-
-    struct RejectDecision {
-        uint256 jobId;
-        bytes32 reason;
-        uint64 deadline;
-        uint256 nonce;
-    }
-}
+AgenticCommerceHooked.Job memory job = _getJob(jobId);
+if (job.status != AgenticCommerceHooked.JobStatus.Submitted) revert WrongDecisionStatus();
 ```
 
-Implement:
-
-- typed-data hashing for complete and reject decisions
-- `usedNonces[underwriter][nonce]`
-- flow-aware status checks:
+Then call the core as the evaluator contract:
 
 ```solidity
-if (hook.jobFlowKind(jobId) == FlowKind.TwoStageOpen) {
-    require(job.status == JobStatus.Funded, "wrong open status");
-} else {
-    require(job.status == JobStatus.Submitted, "wrong submitted status");
-}
+acp.complete(decision.jobId, decision.reason, "");
+acp.reject(decision.jobId, decision.reason, "");
 ```
 
-- `acp.complete(...)` and `acp.reject(...)` forwarding on success
-
-**Step 4: Re-run the evaluator tests**
+**Step 4: Re-run the focused tests**
 
 Run:
 
 ```bash
-forge test --match-path "test/UnderwriterDecisionEvaluator.t.sol"
+forge test --match-path "test/UnderwritingHookAdmission.t.sol"
+forge test --match-path "test/UnderwritingHookDecisions.t.sol"
 ```
 
 Expected: PASS.
@@ -567,33 +442,37 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add contracts/hooks/UnderwriterDecisionEvaluator.sol test/UnderwriterDecisionEvaluator.t.sol
-git commit -m "feat: add underwriter signature evaluator"
+git add contracts/hooks/UnderwritingHook.sol test/helpers/UnderwritingHookTestBase.sol test/UnderwritingHookDecisions.t.sol
+git commit -m "feat: add underwriting signature decisions"
 ```
 
-### Task 6: Publish the Example in Repo Docs
+## Task 4: Publish the Example in Repo Docs
 
 **Files:**
 - Modify: `README.md`
 - Modify: `hook-profiles.md`
 - Modify: `contracts/hooks/UnderwritingHook.sol`
 
-**Step 1: Write the doc assertions as failing review checks**
+**Step 1: Write the doc assertions as review checks**
 
-Before editing, verify the repo docs do not yet mention the underwriting example:
+Run:
 
 ```bash
-rg "UnderwritingHook|UnderwriterDecisionEvaluator" README.md hook-profiles.md contracts/hooks/UnderwritingHook.sol
+rg "UnderwritingHook" README.md hook-profiles.md
+rg "UnderwriterDecisionEvaluator|createOpenJob|TwoStageOpen" README.md hook-profiles.md contracts/hooks/UnderwritingHook.sol
 ```
 
-Expected: no matches.
+Expected:
+
+- first `rg` returns no matches before the docs are updated
+- second `rg` returns no matches after the implementation is aligned to the v2 design
 
 **Step 2: Add the README example row**
 
 Update `README.md`:
 
 ```markdown
-| [UnderwritingHook.sol](./contracts/hooks/UnderwritingHook.sol) | C — Experimental | Underwriter-gated job flow with a minimal open/close lifecycle and signed evaluator decisions. |
+| [UnderwritingHook.sol](./contracts/hooks/UnderwritingHook.sol) | C - Experimental | Underwriter-signed job approval with immutable underwriting commits and an optional hook-linked follow-on close job, all on the unchanged ACP lifecycle. |
 ```
 
 **Step 3: Add profile guidance**
@@ -602,9 +481,10 @@ Update `hook-profiles.md` under Profile C:
 
 ```markdown
 - Example: `UnderwritingHook.sol`
-  - Uses an `Open` job for admission and a hook-linked standalone close job for final evidence.
-  - Keeps parent/close linkage in hook state rather than extending the core with native close lineage.
-  - Omits collateral settlement, coordinator, and slash flows from the MCU prototype.
+  - Uses the standard ACP lifecycle for every job; it does not extend the core with `createOpenJob(...)`.
+  - Supports both single-stage underwritten jobs and a hook-linked follow-on close job.
+  - Keeps parent/close linkage and `AwaitingClose` state entirely inside the hook.
+  - Omits coordinator, collateral, dispute, and settlement sidecars from the MCU prototype.
 ```
 
 **Step 4: Add NatSpec to the hook**
@@ -617,11 +497,11 @@ At the top of `contracts/hooks/UnderwritingHook.sol`, include:
 
 The `FLOW` section should explicitly describe:
 
-1. `createJob(...)` for single-stage
-2. `createOpenJob(...)` for open-stage admission
-3. `createJob(...)` with `parentJobId` for close-stage finalization
-4. evaluator-complete from `Funded` for open jobs
-5. evaluator-complete from `Submitted` for single-stage and close jobs
+1. `createJob(..., evaluator = hook, hook = hook)` for a single-stage job
+2. `setBudget(..., abi.encode(commit))` as the commit-once underwriting step
+3. `submit(..., abi.encode(evidence))` as the evidence handoff step
+4. `completeBySig(...)` and `rejectBySig(...)` as underwriter-signed evaluator actions
+5. optional second `createJob(...)` with `parentJobId` for the close stage
 
 **Step 5: Re-run focused tests and scans**
 
@@ -629,15 +509,14 @@ Run:
 
 ```bash
 forge test --match-path "test/UnderwritingHookAdmission.t.sol"
-forge test --match-path "test/UnderwritingHookLifecycle.t.sol"
-forge test --match-path "test/UnderwriterDecisionEvaluator.t.sol"
-rg "fund\\(uint256,bytes\\)|fund\\(jobId, \\\"\\\"\\)" .
+forge test --match-path "test/UnderwritingHookDecisions.t.sol"
+rg "UnderwriterDecisionEvaluator|createOpenJob|TwoStageOpen" README.md hook-profiles.md contracts/hooks/UnderwritingHook.sol
 ```
 
 Expected:
 
-- all three test files PASS
-- ripgrep returns no old fund-signature references
+- both test files PASS
+- the final `rg` returns no matches
 
 **Step 6: Commit**
 
@@ -648,15 +527,15 @@ git commit -m "docs: publish underwriting hook example"
 
 ## Notes for the Implementer
 
-- Prefer a mock ACP kernel in hook-unit tests when testing hook callbacks directly.
-- Use full end-to-end ACP tests only where core lifecycle behavior matters.
-- Do not reintroduce the full MCU surface by stealth. If you need:
-  - dispute windows
-  - collateral release requests
-  - slashing
-  - settlement identity beyond `parentJobId`
-
-stop and write a separate plan for a larger experimental settlement system.
+- Prefer full ACP integration tests over callback-only mocks here, because the core lifecycle is intentionally unchanged and is part of what this example is proving.
+- Keep the hook self-contained. If a helper type or struct is only used by `UnderwritingHook.sol`, define it there instead of creating a second source file.
+- The hook is allowed to own additional metadata, but it should not become a coordinator.
+- If implementation pressure starts pushing toward any of the following, stop and write a new protocol-variant plan:
+  - `createOpenJob(...)`
+  - `JobKind`
+  - direct `complete()` from `Funded`
+  - native core parent/close lineage
+  - collateral or dispute settlement sidecars
 
 ## Execution Handoff
 
@@ -666,4 +545,4 @@ Plan complete and saved to `docs/plans/2026-03-17-underwriting-hook-example.md`.
 
 **2. Parallel Session (separate)** - open a new session with `superpowers:executing-plans`, then execute the plan with checkpoints.
 
-Choose the option only after the repo is ready to install dependencies and compile the full hook set.
+Choose the option after the Foundry bootstrap step is in place and the base hook regression test is passing.
