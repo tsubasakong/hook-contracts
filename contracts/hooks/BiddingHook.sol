@@ -34,7 +34,7 @@ import "../BaseACPHook.sol";
  *     → _postSetProvider: mark bidding finalised.
  *     Then: setBudget(jobId, bidAmount, "")
  *     → _preSetBudget: enforce budget == committedAmount.
- *  5. fund(jobId, "") — _preFund enforces budget == committedAmount (blocks
+ *  5. fund(jobId, expectedBudget, "") — _preFund enforces budget == committedAmount (blocks
  *     funding if client skipped the second setBudget).
  *  6. Job continues normally: submit → complete.
  *

@@ -29,7 +29,7 @@ import "../BaseACPHook.sol";
  *     → core: set job.budget = serviceFee.
  *
  *  3. Client approves core contract for serviceFee AND this hook for transferAmount.
- *     Client calls fund(jobId, ""):
+ *     Client calls fund(jobId, expectedBudget, ""):
  *     → _preFund: verify client has approved this hook for transferAmount.
  *     → core: pull serviceFee from client into escrow, set Funded.
  *     → _postFund: pull transferAmount from client, forward to provider (capital).

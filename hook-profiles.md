@@ -36,7 +36,7 @@ The profiles assume a core compatible with the hookable ERC-8183 variant (e.g. `
 - **Hooked functions (typical):**
   - `setProvider(jobId, provider, optParams)`
   - `setBudget(jobId, amount, optParams)`
-  - `fund(jobId, optParams)`
+  - `fund(jobId, expectedBudget, optParams)`
   - Optional: `complete(jobId, reason, optParams)` for logging/attestations only
 - **beforeAction:**
   - MAY revert to block the action (e.g. invalid bid, bad signature, not allowlisted).
