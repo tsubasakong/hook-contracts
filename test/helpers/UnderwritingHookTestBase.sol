@@ -15,6 +15,22 @@ contract MintableToken is ERC20 {
 }
 
 abstract contract UnderwritingHookTestBase is Test {
+    struct UnderwriteCommitData {
+        uint256 parentJobId;
+        address underwriter;
+        uint64 validUntil;
+        bytes32 policyHash;
+        bytes32 quoteIdHash;
+        bytes32 termsHash;
+        bool allowCloseJob;
+    }
+
+    struct SubmitEvidenceData {
+        bytes32 bundleHash;
+        bytes32 policyHash;
+        bytes32 quoteIdHash;
+    }
+
     bytes32 internal constant COMPLETE_TYPEHASH =
         keccak256("CompleteDecision(uint256 jobId,bytes32 reason,uint64 deadline,uint256 nonce)");
     bytes32 internal constant REJECT_TYPEHASH =
@@ -29,6 +45,17 @@ abstract contract UnderwritingHookTestBase is Test {
 
     uint256 internal constant DEFAULT_BUDGET = 100e6;
     uint256 internal constant CLOSE_BUDGET = 25e6;
+
+    bytes4 internal constant ERR_ZERO_ADDRESS = bytes4(keccak256("ZeroAddress()"));
+    bytes4 internal constant ERR_UNDERWRITER_NOT_REGISTERED = bytes4(keccak256("UnderwriterNotRegistered()"));
+    bytes4 internal constant ERR_PROVIDER_REQUIRED = bytes4(keccak256("ProviderRequired()"));
+    bytes4 internal constant ERR_EVALUATOR_MISMATCH = bytes4(keccak256("EvaluatorMismatch()"));
+    bytes4 internal constant ERR_COMMIT_EXPIRED = bytes4(keccak256("CommitExpired()"));
+    bytes4 internal constant ERR_COMMIT_LOCKED = bytes4(keccak256("CommitLocked()"));
+    bytes4 internal constant ERR_PARENT_NOT_AWAITING_CLOSE = bytes4(keccak256("ParentNotAwaitingClose()"));
+    bytes4 internal constant ERR_ACTIVE_CLOSE_EXISTS = bytes4(keccak256("ActiveCloseExists()"));
+    bytes4 internal constant ERR_PARENT_MISMATCH = bytes4(keccak256("ParentMismatch()"));
+    bytes4 internal constant ERR_EVIDENCE_MISMATCH = bytes4(keccak256("EvidenceMismatch()"));
 
     bytes32 internal constant DEFAULT_POLICY_HASH = keccak256("policy");
     bytes32 internal constant DEFAULT_QUOTE_ID_HASH = keccak256("quote");
@@ -85,8 +112,8 @@ abstract contract UnderwritingHookTestBase is Test {
         jobId = acp.createJob(providerAddress, evaluator, block.timestamp + 1 days, "job", hookAddress);
     }
 
-    function _singleStageCommit() internal view returns (UnderwritingHook.UnderwriteCommit memory) {
-        return UnderwritingHook.UnderwriteCommit({
+    function _singleStageCommit() internal view returns (UnderwriteCommitData memory) {
+        return UnderwriteCommitData({
             parentJobId: 0,
             underwriter: underwriter,
             validUntil: uint64(block.timestamp + 1 days),
@@ -97,8 +124,8 @@ abstract contract UnderwritingHookTestBase is Test {
         });
     }
 
-    function _parentStageCommit() internal view returns (UnderwritingHook.UnderwriteCommit memory) {
-        return UnderwritingHook.UnderwriteCommit({
+    function _parentStageCommit() internal view returns (UnderwriteCommitData memory) {
+        return UnderwriteCommitData({
             parentJobId: 0,
             underwriter: underwriter,
             validUntil: uint64(block.timestamp + 1 days),
@@ -109,8 +136,8 @@ abstract contract UnderwritingHookTestBase is Test {
         });
     }
 
-    function _closeStageCommit(uint256 parentJobId) internal view returns (UnderwritingHook.UnderwriteCommit memory) {
-        return UnderwritingHook.UnderwriteCommit({
+    function _closeStageCommit(uint256 parentJobId) internal view returns (UnderwriteCommitData memory) {
+        return UnderwriteCommitData({
             parentJobId: parentJobId,
             underwriter: underwriter,
             validUntil: uint64(block.timestamp + 1 days),
@@ -121,23 +148,23 @@ abstract contract UnderwritingHookTestBase is Test {
         });
     }
 
-    function _matchingEvidence() internal pure returns (UnderwritingHook.SubmitEvidence memory) {
-        return UnderwritingHook.SubmitEvidence({
+    function _matchingEvidence() internal pure returns (SubmitEvidenceData memory) {
+        return SubmitEvidenceData({
             bundleHash: keccak256("bundle"),
             policyHash: DEFAULT_POLICY_HASH,
             quoteIdHash: DEFAULT_QUOTE_ID_HASH
         });
     }
 
-    function _mismatchedEvidence() internal pure returns (UnderwritingHook.SubmitEvidence memory) {
-        return UnderwritingHook.SubmitEvidence({
+    function _mismatchedEvidence() internal pure returns (SubmitEvidenceData memory) {
+        return SubmitEvidenceData({
             bundleHash: keccak256("other-bundle"),
             policyHash: DEFAULT_POLICY_HASH,
             quoteIdHash: DEFAULT_QUOTE_ID_HASH
         });
     }
 
-    function _commitBudget(uint256 jobId, uint256 amount, UnderwritingHook.UnderwriteCommit memory commit) internal {
+    function _commitBudget(uint256 jobId, uint256 amount, UnderwriteCommitData memory commit) internal {
         vm.prank(client);
         acp.setBudget(jobId, amount, abi.encode(commit));
     }
@@ -147,7 +174,7 @@ abstract contract UnderwritingHookTestBase is Test {
         acp.fund(jobId, amount, "");
     }
 
-    function _submitEvidence(uint256 jobId, UnderwritingHook.SubmitEvidence memory evidence) internal {
+    function _submitEvidence(uint256 jobId, SubmitEvidenceData memory evidence) internal {
         vm.prank(provider);
         acp.submit(jobId, evidence.bundleHash, abi.encode(evidence));
     }

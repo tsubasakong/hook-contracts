@@ -5,11 +5,13 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "../AgenticCommerceHooked.sol";
 import "../BaseACPHook.sol";
+import "./UnderwritingMCUCore.sol";
 
 /**
  * @title UnderwritingHook
- * @notice Experimental underwriting example that keeps all extra lineage state
- *         in the hook while preserving the standard ACP lifecycle.
+ * @notice Experimental underwriting example whose top-level hook acts as the
+ *         ACP-facing shell and evaluator relay, while `UnderwritingMCUCore`
+ *         owns the internal underwriting workflow state.
  *
  * USE CASE
  * --------
@@ -48,30 +50,17 @@ import "../BaseACPHook.sol";
  * underwrite a job, what evidence must be submitted, and whether a later close
  * job is allowed. It reduces client risk from bad provider behavior by binding
  * payment release to an agreed underwriter decision and to committed evidence
- * hashes. This example is intentionally labeled
+ * hashes. Parent/close lineage is intentionally kept in hook state rather than
+ * promoted into ACP core so this example can model a two-stage underwriting
+ * flow without expanding the shared escrow kernel with workflow-specific
+ * linkage primitives. This example is intentionally labeled
  * experimental rather than production-ready settlement infrastructure.
  */
-contract UnderwritingHook is BaseACPHook, EIP712 {
+contract UnderwritingHook is BaseACPHook, EIP712, UnderwritingMCUCore {
     bytes32 private constant COMPLETE_TYPEHASH =
         keccak256("CompleteDecision(uint256 jobId,bytes32 reason,uint64 deadline,uint256 nonce)");
     bytes32 private constant REJECT_TYPEHASH =
         keccak256("RejectDecision(uint256 jobId,bytes32 reason,uint64 deadline,uint256 nonce)");
-
-    struct UnderwriteCommit {
-        uint256 parentJobId;
-        address underwriter;
-        uint64 validUntil;
-        bytes32 policyHash;
-        bytes32 quoteIdHash;
-        bytes32 termsHash;
-        bool allowCloseJob;
-    }
-
-    struct SubmitEvidence {
-        bytes32 bundleHash;
-        bytes32 policyHash;
-        bytes32 quoteIdHash;
-    }
 
     struct CompleteDecision {
         uint256 jobId;
@@ -88,18 +77,6 @@ contract UnderwritingHook is BaseACPHook, EIP712 {
     }
 
     error OnlyAdmin();
-    error UnderwriterNotRegistered();
-    error ProviderRequired();
-    error EvaluatorMismatch();
-    error ZeroAddress();
-    error CommitExpired();
-    error CommitLocked();
-    error CommitNotFound();
-    error ParentNotCommitted();
-    error ParentNotAwaitingClose();
-    error ActiveCloseExists();
-    error ParentMismatch();
-    error EvidenceMismatch();
     error WrongDecisionStatus();
     error DecisionExpired(uint64 deadline, uint64 currentTimestamp);
     error NonceUsed(address underwriter, uint256 nonce);
@@ -108,13 +85,6 @@ contract UnderwritingHook is BaseACPHook, EIP712 {
     AgenticCommerceHooked public immutable acp;
     address public immutable admin;
 
-    mapping(address => bool) public registeredUnderwriters;
-    mapping(uint256 => UnderwriteCommit) internal commits;
-    mapping(uint256 => bytes32) internal commitHashByJobId;
-    mapping(uint256 => uint256) internal committedBudgetByJobId;
-    mapping(uint256 => bool) internal awaitingCloseByJobId;
-    mapping(uint256 => uint256) internal parentJobIdByCloseJobId;
-    mapping(uint256 => uint256) internal activeCloseJobIdByParentJobId;
     mapping(address => mapping(uint256 => bool)) public usedNonces;
 
     modifier onlyAdmin() {
@@ -129,29 +99,31 @@ contract UnderwritingHook is BaseACPHook, EIP712 {
     }
 
     function registerUnderwriter(address underwriter) external onlyAdmin {
-        if (underwriter == address(0)) revert ZeroAddress();
-        registeredUnderwriters[underwriter] = true;
+        _registerUnderwriter(underwriter);
     }
 
     function unregisterUnderwriter(address underwriter) external onlyAdmin {
-        if (underwriter == address(0)) revert ZeroAddress();
-        delete registeredUnderwriters[underwriter];
+        _unregisterUnderwriter(underwriter);
+    }
+
+    function registeredUnderwriters(address underwriter) external view returns (bool) {
+        return _isRegisteredUnderwriter(underwriter);
     }
 
     function getCommit(uint256 jobId) external view returns (UnderwriteCommit memory) {
-        return commits[jobId];
+        return _getCommit(jobId);
     }
 
     function isAwaitingClose(uint256 jobId) external view returns (bool) {
-        return awaitingCloseByJobId[jobId];
+        return _isAwaitingClose(jobId);
     }
 
     function getParentJobId(uint256 closeJobId) external view returns (uint256) {
-        return parentJobIdByCloseJobId[closeJobId];
+        return _getParentJobId(closeJobId);
     }
 
     function getActiveCloseJobId(uint256 parentJobId) external view returns (uint256) {
-        return activeCloseJobIdByParentJobId[parentJobId];
+        return _getActiveCloseJobId(parentJobId);
     }
 
     function completeBySig(CompleteDecision calldata decision, bytes calldata signature) external {
@@ -193,105 +165,19 @@ contract UnderwritingHook is BaseACPHook, EIP712 {
     }
 
     function _preSetBudget(uint256 jobId, uint256 amount, bytes memory optParams) internal override {
-        AgenticCommerceHooked.Job memory job = acp.getJob(jobId);
-        UnderwriteCommit memory commit = abi.decode(optParams, (UnderwriteCommit));
-        bytes32 newCommitHash = keccak256(abi.encode(commit));
-
-        if (job.provider == address(0)) revert ProviderRequired();
-        if (job.evaluator != address(this)) revert EvaluatorMismatch();
-
-        if (commitHashByJobId[jobId] != bytes32(0)) {
-            if (commitHashByJobId[jobId] != newCommitHash) revert CommitLocked();
-            if (committedBudgetByJobId[jobId] != amount) revert CommitLocked();
-            return;
-        }
-
-        if (commit.validUntil <= block.timestamp) revert CommitExpired();
-
-        if (commit.parentJobId == 0) {
-            if (!registeredUnderwriters[commit.underwriter]) revert UnderwriterNotRegistered();
-        } else {
-            _clearStaleCloseIfTerminal(commit.parentJobId);
-            _validateCloseCommit(jobId, job, commit);
-            parentJobIdByCloseJobId[jobId] = commit.parentJobId;
-            activeCloseJobIdByParentJobId[commit.parentJobId] = jobId;
-        }
-
-        commitHashByJobId[jobId] = newCommitHash;
-        committedBudgetByJobId[jobId] = amount;
-        commits[jobId] = commit;
+        _preSetBudgetWorkflow(acp, address(this), jobId, amount, optParams);
     }
 
     function _postSubmit(uint256 jobId, bytes32 deliverable, bytes memory optParams) internal view override {
-        SubmitEvidence memory evidence = abi.decode(optParams, (SubmitEvidence));
-        UnderwriteCommit memory commit = _requireCommit(jobId);
-
-        if (deliverable != evidence.bundleHash) revert EvidenceMismatch();
-        if (evidence.policyHash != commit.policyHash) revert EvidenceMismatch();
-        if (evidence.quoteIdHash != commit.quoteIdHash) revert EvidenceMismatch();
+        _postSubmitWorkflow(jobId, deliverable, optParams);
     }
 
     function _postComplete(uint256 jobId, bytes32, bytes memory) internal override {
-        UnderwriteCommit memory commit = _requireCommit(jobId);
-        if (commit.parentJobId == 0 && commit.allowCloseJob) {
-            awaitingCloseByJobId[jobId] = true;
-            return;
-        }
-
-        if (commit.parentJobId != 0) {
-            uint256 parentJobId = commit.parentJobId;
-            if (activeCloseJobIdByParentJobId[parentJobId] == jobId) {
-                delete activeCloseJobIdByParentJobId[parentJobId];
-            }
-            delete awaitingCloseByJobId[parentJobId];
-        }
+        _postCompleteWorkflow(jobId);
     }
 
     function _postReject(uint256 jobId, bytes32, bytes memory) internal override {
-        UnderwriteCommit memory commit = commits[jobId];
-        if (commit.parentJobId != 0 && activeCloseJobIdByParentJobId[commit.parentJobId] == jobId) {
-            delete activeCloseJobIdByParentJobId[commit.parentJobId];
-        }
-    }
-
-    function _validateCloseCommit(uint256 jobId, AgenticCommerceHooked.Job memory job, UnderwriteCommit memory commit) internal view {
-        UnderwriteCommit memory parentCommit = commits[commit.parentJobId];
-        AgenticCommerceHooked.Job memory parentJob = acp.getJob(commit.parentJobId);
-        uint256 activeCloseJobId = activeCloseJobIdByParentJobId[commit.parentJobId];
-
-        if (commitHashByJobId[commit.parentJobId] == bytes32(0)) revert ParentNotCommitted();
-        if (parentJob.id == 0) revert ParentMismatch();
-        if (commit.parentJobId == jobId) revert ParentMismatch();
-        if (parentCommit.parentJobId != 0 || !parentCommit.allowCloseJob || commit.allowCloseJob) {
-            revert ParentMismatch();
-        }
-        if (
-            parentJob.client != job.client || parentJob.provider != job.provider || parentJob.evaluator != job.evaluator
-                || parentJob.hook != job.hook
-        ) revert ParentMismatch();
-        if (parentCommit.underwriter != commit.underwriter) revert ParentMismatch();
-        if (parentJob.status != AgenticCommerceHooked.JobStatus.Completed || !awaitingCloseByJobId[commit.parentJobId]) {
-            revert ParentNotAwaitingClose();
-        }
-        if (activeCloseJobId != 0 && activeCloseJobId != jobId) revert ActiveCloseExists();
-    }
-
-    function _clearStaleCloseIfTerminal(uint256 parentJobId) internal {
-        uint256 activeCloseJobId = activeCloseJobIdByParentJobId[parentJobId];
-        if (activeCloseJobId == 0) return;
-
-        AgenticCommerceHooked.Job memory activeCloseJob = acp.getJob(activeCloseJobId);
-        if (
-            activeCloseJob.status == AgenticCommerceHooked.JobStatus.Rejected
-                || activeCloseJob.status == AgenticCommerceHooked.JobStatus.Expired
-        ) {
-            delete activeCloseJobIdByParentJobId[parentJobId];
-        }
-    }
-
-    function _requireCommit(uint256 jobId) internal view returns (UnderwriteCommit memory) {
-        if (commitHashByJobId[jobId] == bytes32(0)) revert CommitNotFound();
-        return commits[jobId];
+        _postRejectWorkflow(jobId);
     }
 
     function _consumeNonceAndVerifySigner(

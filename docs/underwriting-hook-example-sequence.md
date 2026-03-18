@@ -1,10 +1,11 @@
 # Underwriting Hook Example Sequence
 
-This diagram shows how the minimal `UnderwritingHook` example works with
+This diagram shows how the refactored underwriting example works with
 `AgenticCommerceHooked`, and how it relates to the fuller MCU design in
 `ERC-ACP`.
 
-- `UnderwritingHook` is both the hook and the evaluator in this example.
+- `UnderwritingHook` is the ACP-facing shell and evaluator relay.
+- `UnderwritingMCUCore` is the internal underwriting workflow module behind it.
 - Every job still uses the standard ACP lifecycle:
   `createJob -> setBudget -> fund -> submit -> complete/reject`
 - The full MCU sidecars are intentionally omitted here:
@@ -20,50 +21,62 @@ sequenceDiagram
     actor Underwriter
     participant ACP as AgenticCommerceHooked
     participant Hook as UnderwritingHook
+    participant MCUCore as UnderwritingMCUCore
     participant Coord as MCUCoordinator
     participant Escrow as MCUSettlementEscrow
     participant Collateral as CollateralManager
 
-    Note over Hook,Collateral: Minimal example boundary: no Coordinator, Escrow, or CollateralManager calls. UnderwritingHook also plays the evaluator role.
+    Note over Hook,Collateral: Boundary in this example: ACP talks to UnderwritingHook, UnderwritingHook delegates workflow state to UnderwritingMCUCore, and the larger MCU sidecars are intentionally omitted.
 
     Admin->>Hook: registerUnderwriter(underwriter)
+    Hook->>MCUCore: store registered underwriter
 
     Client->>ACP: createJob(provider, evaluator=Hook, hook=Hook)
     Client->>ACP: setBudget(jobId, amount, abi.encode(commit))
     ACP->>Hook: beforeAction(jobId, setBudget, data)
-    Hook-->>ACP: lock budget + commit underwriting terms + choose SingleStage or ParentPlusClose
+    Hook->>MCUCore: preSetBudgetWorkflow(...)
+    MCUCore-->>Hook: lock budget + commit underwriting terms + choose SingleStage or ParentPlusClose
+    Hook-->>ACP: allow setBudget
 
     Client->>ACP: fund(jobId, amount, "")
     Provider->>ACP: submit(jobId, bundleHash, abi.encode(evidence))
     ACP->>Hook: afterAction(jobId, submit, data)
-    Hook-->>ACP: verify bundleHash, policyHash, and quoteIdHash
+    Hook->>MCUCore: postSubmitWorkflow(...)
+    MCUCore-->>Hook: verify bundleHash, policyHash, and quoteIdHash
 
     Underwriter-->>Client: sign CompleteDecision or RejectDecision
     Client->>Hook: completeBySig(...) or rejectBySig(...)
-    Hook->>Hook: verify signer, deadline, nonce, and committed underwriter
+    Hook->>MCUCore: load committed underwriter + workflow state
+    Hook->>Hook: verify signer, deadline, and nonce
     Hook->>ACP: complete(jobId, ...) or reject(jobId, ...)
 
     alt First job rejected
         ACP->>Hook: afterAction(jobId, reject, data)
+        Hook->>MCUCore: postRejectWorkflow(jobId)
         Note over Client,Hook: Workflow ends. No close job is admitted.
 
     else First job approved as SingleStage
         ACP->>Hook: afterAction(jobId, complete, data)
+        Hook->>MCUCore: postCompleteWorkflow(jobId)
         Note over Client,Hook: Workflow ends after the first approved job.
 
     else First job approved as ParentPlusClose
         ACP->>Hook: afterAction(parentJobId, complete, data)
-        Note over Hook: parent job marked AwaitingClose
+        Hook->>MCUCore: postCompleteWorkflow(parentJobId)
+        Note over MCUCore: parent job marked AwaitingClose
 
         Client->>ACP: createJob(provider, evaluator=Hook, hook=Hook)
         Client->>ACP: setBudget(closeJobId, closeAmount, abi.encode(closeCommit{parentJobId}))
         ACP->>Hook: beforeAction(closeJobId, setBudget, data)
-        Hook-->>ACP: validate same actors, same underwriter, parent AwaitingClose, and lazily clear stale close linkage if needed
+        Hook->>MCUCore: preSetBudgetWorkflow(...)
+        MCUCore-->>Hook: validate same actors, same underwriter, parent AwaitingClose, and lazily clear stale close linkage if needed
+        Hook-->>ACP: allow close commit
 
         Client->>ACP: fund(closeJobId, closeAmount, "")
         Provider->>ACP: submit(closeJobId, closeBundleHash, abi.encode(closeEvidence))
         ACP->>Hook: afterAction(closeJobId, submit, data)
-        Hook-->>ACP: verify close evidence against the close commit
+        Hook->>MCUCore: postSubmitWorkflow(...)
+        MCUCore-->>Hook: verify close evidence against the close commit
 
         Underwriter-->>Client: sign close CompleteDecision or RejectDecision
         Client->>Hook: completeBySig(...) or rejectBySig(...)
@@ -71,15 +84,17 @@ sequenceDiagram
 
         alt Close approved
             ACP->>Hook: afterAction(closeJobId, complete, data)
-            Note over Hook: clear activeClose linkage and clear AwaitingClose
+            Hook->>MCUCore: postCompleteWorkflow(closeJobId)
+            Note over MCUCore: clear activeClose linkage and clear AwaitingClose
 
         else Close rejected
             ACP->>Hook: afterAction(closeJobId, reject, data)
-            Note over Hook: clear activeClose only; parent stays AwaitingClose
+            Hook->>MCUCore: postRejectWorkflow(closeJobId)
+            Note over MCUCore: clear activeClose only; parent stays AwaitingClose
 
         else Close expires
             Client->>ACP: claimRefund(closeJobId)
-            Note over Hook: claimRefund is not hookable; the next close commit lazily clears the stale activeClose slot
+            Note over MCUCore: claimRefund is not hookable; the next close commit lazily clears the stale activeClose slot
         end
     end
 ```
@@ -89,8 +104,15 @@ sequenceDiagram
 - The first committed job decides whether the flow is:
   - `SingleStage`, or
   - `ParentPlusClose` via `allowCloseJob = true`
-- `AwaitingClose` only exists inside `UnderwritingHook`; ACP itself does not
-  know about parent/close lineage.
+- `AwaitingClose` only exists inside the hook-owned underwriting workflow
+  state; ACP itself does not know about parent/close lineage.
+- The top-level hook is intentionally thin: it adapts ACP callbacks and
+  signature decisions, while `UnderwritingMCUCore` owns commit locking,
+  lineage, and evidence/state transitions.
+- That is a deliberate design choice: this example keeps parent/close linkage
+  in the hook to minimize changes to the current ACP core and avoid turning one
+  experimental underwriting workflow into a generic kernel-level linkage
+  primitive.
 - The underwriter decision is signature-based:
   the signer decides off-chain, and a caller relays that signature on-chain.
 - Compared with the full MCU system in `ERC-ACP`, this example stops at the

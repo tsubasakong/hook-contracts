@@ -5,12 +5,12 @@ import "./helpers/UnderwritingHookTestBase.sol";
 
 contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
     function testConstructorRequiresNonZeroAdmin() public {
-        vm.expectRevert(UnderwritingHook.ZeroAddress.selector);
+        vm.expectRevert(ERR_ZERO_ADDRESS);
         new UnderwritingHook(address(acp), address(0));
     }
 
     function testRegisterUnderwriterRejectsZeroAddress() public {
-        vm.expectRevert(UnderwritingHook.ZeroAddress.selector);
+        vm.expectRevert(ERR_ZERO_ADDRESS);
         hook.registerUnderwriter(address(0));
     }
 
@@ -18,7 +18,7 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
         uint256 jobId = _createBaseJob(address(hook), address(hook));
 
         vm.prank(client);
-        vm.expectRevert(UnderwritingHook.UnderwriterNotRegistered.selector);
+        vm.expectRevert(ERR_UNDERWRITER_NOT_REGISTERED);
         acp.setBudget(jobId, DEFAULT_BUDGET, abi.encode(_singleStageCommit()));
     }
 
@@ -27,7 +27,7 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
         uint256 jobId = _createJobWithoutProvider(address(hook), address(hook));
 
         vm.prank(client);
-        vm.expectRevert(UnderwritingHook.ProviderRequired.selector);
+        vm.expectRevert(ERR_PROVIDER_REQUIRED);
         acp.setBudget(jobId, DEFAULT_BUDGET, abi.encode(_singleStageCommit()));
     }
 
@@ -36,37 +36,37 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
         uint256 jobId = _createBaseJob(address(hook), outsider);
 
         vm.prank(client);
-        vm.expectRevert(UnderwritingHook.EvaluatorMismatch.selector);
+        vm.expectRevert(ERR_EVALUATOR_MISMATCH);
         acp.setBudget(jobId, DEFAULT_BUDGET, abi.encode(_singleStageCommit()));
     }
 
     function testFirstCommitRequiresFutureValidityWindow() public {
         _registerUnderwriter();
         uint256 jobId = _createBaseJob(address(hook), address(hook));
-        UnderwritingHook.UnderwriteCommit memory commit = _singleStageCommit();
+        UnderwriteCommitData memory commit = _singleStageCommit();
         commit.validUntil = uint64(block.timestamp);
 
         vm.prank(client);
-        vm.expectRevert(UnderwritingHook.CommitExpired.selector);
+        vm.expectRevert(ERR_COMMIT_EXPIRED);
         acp.setBudget(jobId, DEFAULT_BUDGET, abi.encode(commit));
     }
 
     function testFirstCommitLocksBudgetAndPayload() public {
         _registerUnderwriter();
         uint256 jobId = _createBaseJob(address(hook), address(hook));
-        UnderwritingHook.UnderwriteCommit memory commit = _singleStageCommit();
+        UnderwriteCommitData memory commit = _singleStageCommit();
 
         _commitBudget(jobId, DEFAULT_BUDGET, commit);
 
         vm.prank(client);
-        vm.expectRevert(UnderwritingHook.CommitLocked.selector);
+        vm.expectRevert(ERR_COMMIT_LOCKED);
         acp.setBudget(jobId, DEFAULT_BUDGET + 1, abi.encode(commit));
     }
 
     function testSameBudgetReplayWithSamePayloadIsAllowed() public {
         _registerUnderwriter();
         uint256 jobId = _createBaseJob(address(hook), address(hook));
-        UnderwritingHook.UnderwriteCommit memory commit = _singleStageCommit();
+        UnderwriteCommitData memory commit = _singleStageCommit();
 
         _commitBudget(jobId, DEFAULT_BUDGET, commit);
         _commitBudget(jobId, DEFAULT_BUDGET, commit);
@@ -93,7 +93,7 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
         uint256 closeJobId = _createBaseJob(address(hook), address(hook));
 
         vm.prank(client);
-        vm.expectRevert(UnderwritingHook.ParentMismatch.selector);
+        vm.expectRevert(ERR_PARENT_MISMATCH);
         acp.setBudget(closeJobId, CLOSE_BUDGET, abi.encode(_closeStageCommit(parentJobId)));
     }
 
@@ -105,7 +105,7 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
         uint256 closeJobId = _createBaseJob(address(hook), address(hook));
 
         vm.prank(client);
-        vm.expectRevert(UnderwritingHook.ParentNotAwaitingClose.selector);
+        vm.expectRevert(ERR_PARENT_NOT_AWAITING_CLOSE);
         acp.setBudget(closeJobId, CLOSE_BUDGET, abi.encode(_closeStageCommit(parentJobId)));
     }
 
@@ -123,11 +123,11 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
         uint256 parentJobId = _completeParentStageJob();
         uint256 closeJobId = _createBaseJob(address(hook), address(hook));
 
-        UnderwritingHook.UnderwriteCommit memory closeCommit = _closeStageCommit(parentJobId);
+        UnderwriteCommitData memory closeCommit = _closeStageCommit(parentJobId);
         closeCommit.underwriter = outsider;
 
         vm.prank(client);
-        vm.expectRevert(UnderwritingHook.ParentMismatch.selector);
+        vm.expectRevert(ERR_PARENT_MISMATCH);
         acp.setBudget(closeJobId, CLOSE_BUDGET, abi.encode(closeCommit));
     }
 
@@ -136,7 +136,7 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
         uint256 closeJobId = _createJobWithProvider(outsider, address(hook), address(hook));
 
         vm.prank(client);
-        vm.expectRevert(UnderwritingHook.ParentMismatch.selector);
+        vm.expectRevert(ERR_PARENT_MISMATCH);
         acp.setBudget(closeJobId, CLOSE_BUDGET, abi.encode(_closeStageCommit(parentJobId)));
     }
 
@@ -148,7 +148,7 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
         uint256 secondCloseJobId = _createBaseJob(address(hook), address(hook));
 
         vm.prank(client);
-        vm.expectRevert(UnderwritingHook.ActiveCloseExists.selector);
+        vm.expectRevert(ERR_ACTIVE_CLOSE_EXISTS);
         acp.setBudget(secondCloseJobId, CLOSE_BUDGET, abi.encode(_closeStageCommit(parentJobId)));
     }
 }

@@ -11,7 +11,7 @@ contract UnderwritingHookDecisionsTest is UnderwritingHookTestBase {
         _fundJob(jobId, DEFAULT_BUDGET);
 
         vm.prank(provider);
-        vm.expectRevert(UnderwritingHook.EvidenceMismatch.selector);
+        vm.expectRevert(ERR_EVIDENCE_MISMATCH);
         acp.submit(jobId, keccak256("deliverable"), abi.encode(_mismatchedEvidence()));
     }
 
@@ -21,11 +21,11 @@ contract UnderwritingHookDecisionsTest is UnderwritingHookTestBase {
         _commitBudget(jobId, DEFAULT_BUDGET, _singleStageCommit());
         _fundJob(jobId, DEFAULT_BUDGET);
 
-        UnderwritingHook.SubmitEvidence memory evidence = _matchingEvidence();
+        SubmitEvidenceData memory evidence = _matchingEvidence();
         evidence.policyHash = keccak256("wrong-policy");
 
         vm.prank(provider);
-        vm.expectRevert(UnderwritingHook.EvidenceMismatch.selector);
+        vm.expectRevert(ERR_EVIDENCE_MISMATCH);
         acp.submit(jobId, evidence.bundleHash, abi.encode(evidence));
     }
 
@@ -35,11 +35,11 @@ contract UnderwritingHookDecisionsTest is UnderwritingHookTestBase {
         _commitBudget(jobId, DEFAULT_BUDGET, _singleStageCommit());
         _fundJob(jobId, DEFAULT_BUDGET);
 
-        UnderwritingHook.SubmitEvidence memory evidence = _matchingEvidence();
+        SubmitEvidenceData memory evidence = _matchingEvidence();
         evidence.quoteIdHash = keccak256("wrong-quote");
 
         vm.prank(provider);
-        vm.expectRevert(UnderwritingHook.EvidenceMismatch.selector);
+        vm.expectRevert(ERR_EVIDENCE_MISMATCH);
         acp.submit(jobId, evidence.bundleHash, abi.encode(evidence));
     }
 
