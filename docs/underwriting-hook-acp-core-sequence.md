@@ -47,7 +47,7 @@ sequenceDiagram
     Note over ACP,Hook: fund() still follows the ACP lifecycle, but UnderwritingHook does not add extra fund logic.
 
     Provider->>ACP: submit(jobId, bundleHash, abi.encode(evidence))
-    Note over ACP,Hook: ACP also calls beforeAction on submit; UnderwritingHook leaves _preSubmit as a no-op.
+    Note over ACP,Hook: ACP also calls beforeAction on submit. UnderwritingHook leaves _preSubmit as a no-op.
     ACP->>Hook: afterAction(jobId, submit, abi.encode(bundleHash, evidence))
     Hook->>Workflow: _postSubmitWorkflow(jobId, bundleHash, evidence)
     Workflow-->>Hook: Load locked commit and verify bundleHash, policyHash, and quoteIdHash.
@@ -76,7 +76,7 @@ sequenceDiagram
         Workflow-->>Hook: Clear activeClose and clear parent AwaitingClose.
     else Close rejected
         Hook->>Workflow: _postRejectWorkflow(closeJobId)
-        Workflow-->>Hook: Clear activeClose only; parent stays AwaitingClose.
+        Workflow-->>Hook: Clear activeClose only. Parent stays AwaitingClose.
     else First-stage rejected or single-stage completed
         Hook->>Workflow: _postRejectWorkflow(jobId) or _postCompleteWorkflow(jobId)
         Workflow-->>Hook: No parent/close linkage change.

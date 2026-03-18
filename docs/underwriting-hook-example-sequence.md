@@ -90,11 +90,11 @@ sequenceDiagram
         else Close rejected
             ACP->>Hook: afterAction(closeJobId, reject, data)
             Hook->>WorkflowCore: postRejectWorkflow(closeJobId)
-            Note over WorkflowCore: clear activeClose only; parent stays AwaitingClose
+            Note over WorkflowCore: clear activeClose only. Parent stays AwaitingClose.
 
         else Close expires
             Client->>ACP: claimRefund(closeJobId)
-            Note over WorkflowCore: claimRefund is not hookable; the next close commit lazily clears the stale activeClose slot
+            Note over WorkflowCore: claimRefund is not hookable. The next close commit lazily clears the stale activeClose slot.
         end
     end
 ```
