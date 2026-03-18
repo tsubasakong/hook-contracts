@@ -158,12 +158,13 @@ A two‑phase hook can:
 
 - Example implementation: `contracts/hooks/UnderwritingHook.sol`
 - Uses the standard ACP lifecycle for every job; it does **not** extend the core with a separate open-job entrypoint.
-- Keeps `UnderwritingHook.sol` as the ACP-facing shell and evaluator relay, with `UnderwritingWorkflowCore.sol` owning the internal underwriting workflow state.
-- Stores immutable underwriting commits at `setBudget(...)`, validates submit-time evidence, and relays EIP-712 underwriter decisions through `completeBySig(...)` / `rejectBySig(...)`.
+- Keeps `UnderwritingHook.sol` as the ACP-facing shell, adds `UnderwritingEvaluator.sol` as the EIP-712 decision relay, and keeps `UnderwritingWorkflowCore.sol` as the internal underwriting workflow state.
+- Adds a lightweight `UnderwritingCoordinator.sol` scaffold that marks funded jobs `Protected` before submission, without implementing the full MCU monetary sidecars yet.
+- Stores immutable underwriting commits at `setBudget(...)`, validates submit-time evidence, and relays underwriter decisions through `UnderwritingEvaluator.completeBySig(...)` / `rejectBySig(...)`.
 - Supports both:
   - a single-stage underwritten job, and
   - a parent job that may later admit one hook-linked follow-on close job.
 - Keeps `AwaitingClose` and parent/close linkage entirely inside hook state instead of extending the shared ACP core.
 - This is a deliberate design tradeoff: keeping lineage in the hook minimizes changes to the current ACP kernel and avoids promoting an experimental workflow-specific relationship into the generic core contract.
-- Omits coordinator, collateral, dispute, and settlement sidecars from the larger MCU prototype; treat it as an experimental policy example, not production settlement infrastructure.
+- Omits premium, collateral, principal deployment, dispute, and settlement sidecars from the larger MCU prototype; treat it as an experimental workflow scaffold rather than production settlement infrastructure.
 

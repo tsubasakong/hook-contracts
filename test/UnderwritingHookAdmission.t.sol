@@ -2,11 +2,38 @@
 pragma solidity ^0.8.20;
 
 import "./helpers/UnderwritingHookTestBase.sol";
+import "../contracts/hooks/UnderwritingTypes.sol";
 
 contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
     function testConstructorRequiresNonZeroAdmin() public {
         vm.expectRevert(ERR_ZERO_ADDRESS);
         new UnderwritingHook(address(acp), address(0));
+    }
+
+    function testSetBudgetRequiresWiringComplete() public {
+        UnderwritingHook unwiredHook = new UnderwritingHook(address(acp), address(this));
+        unwiredHook.registerUnderwriter(underwriter);
+
+        uint256 jobId = _createBaseJob(address(unwiredHook), outsider);
+
+        vm.prank(client);
+        vm.expectRevert(UnderwritingHook.WiringIncomplete.selector);
+        acp.setBudget(jobId, DEFAULT_BUDGET, abi.encode(_singleStageCommit()));
+    }
+
+    function testWiringCannotBeSetTwice() public {
+        vm.expectRevert(UnderwritingHook.WiringAlreadySet.selector);
+        hook.setWiring(address(evaluator), address(coordinator));
+    }
+
+    function testWiringRejectsMismatchedEvaluator() public {
+        UnderwritingHook targetHook = new UnderwritingHook(address(acp), address(this));
+        UnderwritingHook otherHook = new UnderwritingHook(address(acp), address(this));
+        UnderwritingEvaluator wrongEvaluator = new UnderwritingEvaluator(address(acp), address(otherHook));
+        UnderwritingCoordinator targetCoordinator = new UnderwritingCoordinator(address(acp), address(targetHook));
+
+        vm.expectRevert(UnderwritingHook.InvalidWiring.selector);
+        targetHook.setWiring(address(wrongEvaluator), address(targetCoordinator));
     }
 
     function testRegisterUnderwriterRejectsZeroAddress() public {
@@ -15,7 +42,7 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
     }
 
     function testFirstCommitRequiresRegisteredUnderwriter() public {
-        uint256 jobId = _createBaseJob(address(hook), address(hook));
+        uint256 jobId = _createBaseJob(address(hook), address(evaluator));
 
         vm.prank(client);
         vm.expectRevert(ERR_UNDERWRITER_NOT_REGISTERED);
@@ -24,14 +51,14 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
 
     function testFirstCommitRequiresProviderAlreadySet() public {
         _registerUnderwriter();
-        uint256 jobId = _createJobWithoutProvider(address(hook), address(hook));
+        uint256 jobId = _createJobWithoutProvider(address(hook), address(evaluator));
 
         vm.prank(client);
         vm.expectRevert(ERR_PROVIDER_REQUIRED);
         acp.setBudget(jobId, DEFAULT_BUDGET, abi.encode(_singleStageCommit()));
     }
 
-    function testFirstCommitRequiresEvaluatorToBeHook() public {
+    function testFirstCommitRequiresConfiguredEvaluator() public {
         _registerUnderwriter();
         uint256 jobId = _createBaseJob(address(hook), outsider);
 
@@ -42,8 +69,8 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
 
     function testFirstCommitRequiresFutureValidityWindow() public {
         _registerUnderwriter();
-        uint256 jobId = _createBaseJob(address(hook), address(hook));
-        UnderwriteCommitData memory commit = _singleStageCommit();
+        uint256 jobId = _createBaseJob(address(hook), address(evaluator));
+        UnderwritingTypes.UnderwriteCommit memory commit = _singleStageCommit();
         commit.validUntil = uint64(block.timestamp);
 
         vm.prank(client);
@@ -53,8 +80,8 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
 
     function testFirstCommitLocksBudgetAndPayload() public {
         _registerUnderwriter();
-        uint256 jobId = _createBaseJob(address(hook), address(hook));
-        UnderwriteCommitData memory commit = _singleStageCommit();
+        uint256 jobId = _createBaseJob(address(hook), address(evaluator));
+        UnderwritingTypes.UnderwriteCommit memory commit = _singleStageCommit();
 
         _commitBudget(jobId, DEFAULT_BUDGET, commit);
 
@@ -65,8 +92,8 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
 
     function testSameBudgetReplayWithSamePayloadIsAllowed() public {
         _registerUnderwriter();
-        uint256 jobId = _createBaseJob(address(hook), address(hook));
-        UnderwriteCommitData memory commit = _singleStageCommit();
+        uint256 jobId = _createBaseJob(address(hook), address(evaluator));
+        UnderwritingTypes.UnderwriteCommit memory commit = _singleStageCommit();
 
         _commitBudget(jobId, DEFAULT_BUDGET, commit);
         _commitBudget(jobId, DEFAULT_BUDGET, commit);
@@ -80,17 +107,39 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
         assertTrue(hook.isAwaitingClose(parentJobId));
     }
 
+    function testOnlyCoordinatorCanMarkProtected() public {
+        _registerUnderwriter();
+        uint256 jobId = _createBaseJob(address(hook), address(evaluator));
+        _commitBudget(jobId, DEFAULT_BUDGET, _singleStageCommit());
+        _fundJob(jobId, DEFAULT_BUDGET);
+
+        vm.prank(client);
+        vm.expectRevert(UnderwritingHook.OnlyCoordinator.selector);
+        hook.markProtected(jobId);
+    }
+
+    function testCoordinatorRequiresFundedJob() public {
+        _registerUnderwriter();
+        uint256 jobId = _createBaseJob(address(hook), address(evaluator));
+        _commitBudget(jobId, DEFAULT_BUDGET, _singleStageCommit());
+
+        vm.expectRevert(UnderwritingCoordinator.WrongJobStatus.selector);
+        coordinator.orchestrateFunding(jobId);
+    }
+
     function testCloseCommitRequiresParentToAllowCloseJob() public {
         _registerUnderwriter();
-        uint256 parentJobId = _createBaseJob(address(hook), address(hook));
+        uint256 parentJobId = _createBaseJob(address(hook), address(evaluator));
         _commitBudget(parentJobId, DEFAULT_BUDGET, _singleStageCommit());
         _fundJob(parentJobId, DEFAULT_BUDGET);
+        _protectJob(parentJobId);
         _submitEvidence(parentJobId, _matchingEvidence());
 
-        vm.prank(address(hook));
-        acp.complete(parentJobId, DEFAULT_REASON, "");
+        (UnderwritingTypes.CompleteDecision memory decision, bytes memory signature) =
+            _signedCompleteDecision(parentJobId, UNDERWRITER_PK);
+        evaluator.completeBySig(decision, signature);
 
-        uint256 closeJobId = _createBaseJob(address(hook), address(hook));
+        uint256 closeJobId = _createBaseJob(address(hook), address(evaluator));
 
         vm.prank(client);
         vm.expectRevert(ERR_PARENT_MISMATCH);
@@ -99,10 +148,10 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
 
     function testCloseCommitRequiresParentAwaitingClose() public {
         _registerUnderwriter();
-        uint256 parentJobId = _createBaseJob(address(hook), address(hook));
+        uint256 parentJobId = _createBaseJob(address(hook), address(evaluator));
         _commitBudget(parentJobId, DEFAULT_BUDGET, _parentStageCommit());
 
-        uint256 closeJobId = _createBaseJob(address(hook), address(hook));
+        uint256 closeJobId = _createBaseJob(address(hook), address(evaluator));
 
         vm.prank(client);
         vm.expectRevert(ERR_PARENT_NOT_AWAITING_CLOSE);
@@ -112,7 +161,7 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
     function testCloseCommitStoresParentLinkage() public {
         uint256 parentJobId = _completeParentStageJob();
 
-        uint256 closeJobId = _createBaseJob(address(hook), address(hook));
+        uint256 closeJobId = _createBaseJob(address(hook), address(evaluator));
         _commitBudget(closeJobId, CLOSE_BUDGET, _closeStageCommit(parentJobId));
 
         assertEq(hook.getParentJobId(closeJobId), parentJobId);
@@ -121,9 +170,9 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
 
     function testCloseCommitRequiresSameUnderwriterAsParent() public {
         uint256 parentJobId = _completeParentStageJob();
-        uint256 closeJobId = _createBaseJob(address(hook), address(hook));
+        uint256 closeJobId = _createBaseJob(address(hook), address(evaluator));
 
-        UnderwriteCommitData memory closeCommit = _closeStageCommit(parentJobId);
+        UnderwritingTypes.UnderwriteCommit memory closeCommit = _closeStageCommit(parentJobId);
         closeCommit.underwriter = outsider;
 
         vm.prank(client);
@@ -133,7 +182,7 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
 
     function testCloseCommitRequiresSameActorsAsParent() public {
         uint256 parentJobId = _completeParentStageJob();
-        uint256 closeJobId = _createJobWithProvider(outsider, address(hook), address(hook));
+        uint256 closeJobId = _createJobWithProvider(outsider, address(hook), address(evaluator));
 
         vm.prank(client);
         vm.expectRevert(ERR_PARENT_MISMATCH);
@@ -142,10 +191,10 @@ contract UnderwritingHookAdmissionTest is UnderwritingHookTestBase {
 
     function testSecondActiveCloseJobIsBlocked() public {
         uint256 parentJobId = _completeParentStageJob();
-        uint256 firstCloseJobId = _createBaseJob(address(hook), address(hook));
+        uint256 firstCloseJobId = _createBaseJob(address(hook), address(evaluator));
         _commitBudget(firstCloseJobId, CLOSE_BUDGET, _closeStageCommit(parentJobId));
 
-        uint256 secondCloseJobId = _createBaseJob(address(hook), address(hook));
+        uint256 secondCloseJobId = _createBaseJob(address(hook), address(evaluator));
 
         vm.prank(client);
         vm.expectRevert(ERR_ACTIVE_CLOSE_EXISTS);

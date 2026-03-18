@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "../AgenticCommerceHooked.sol";
+import "./UnderwritingTypes.sol";
 
 /**
  * @title UnderwritingWorkflowCore
@@ -13,9 +14,11 @@ import "../AgenticCommerceHooked.sol";
  * track: the registered underwriter set, the locked commitment for each job,
  * and the optional parent/close linkage for a two-stage underwritten flow.
  *
- * `UnderwritingHook` remains the thin ACP-facing shell and signature relay.
- * This module is where the underwriting-specific admission rules live:
- * commit locking, evidence matching, `AwaitingClose`, and close-job lineage.
+ * `UnderwritingHook` remains the thin ACP-facing shell.
+ * This module is where the underwriting-specific admission rules and sidecar
+ * state live: commit locking, evidence matching, `AwaitingClose`, close-job
+ * lineage, and the trimmed MCU-style state machine used by the coordinator and
+ * evaluator scaffold.
  *
  * FLOW (workflow helpers marked with →)
  * ----
@@ -56,22 +59,6 @@ import "../AgenticCommerceHooked.sol";
  * parent/close lineage.
  */
 abstract contract UnderwritingWorkflowCore {
-    struct UnderwriteCommit {
-        uint256 parentJobId;
-        address underwriter;
-        uint64 validUntil;
-        bytes32 policyHash;
-        bytes32 quoteIdHash;
-        bytes32 termsHash;
-        bool allowCloseJob;
-    }
-
-    struct SubmitEvidence {
-        bytes32 bundleHash;
-        bytes32 policyHash;
-        bytes32 quoteIdHash;
-    }
-
     error UnderwriterNotRegistered();
     error ProviderRequired();
     error EvaluatorMismatch();
@@ -84,18 +71,20 @@ abstract contract UnderwritingWorkflowCore {
     error ActiveCloseExists();
     error ParentMismatch();
     error EvidenceMismatch();
+    error InvalidState();
 
     // -------------------------------------------------------------------------
     // Workflow storage
     // -------------------------------------------------------------------------
 
     mapping(address => bool) internal registeredUnderwriterByAddress;
-    mapping(uint256 => UnderwriteCommit) internal commits;
+    mapping(uint256 => UnderwritingTypes.UnderwriteCommit) internal commits;
     mapping(uint256 => bytes32) internal commitHashByJobId; // keccak256 lock for the committed underwriting terms
     mapping(uint256 => uint256) internal committedBudgetByJobId; // budget that was locked alongside the commit hash
     mapping(uint256 => bool) internal awaitingCloseByJobId; // true once an approved parent may admit a close job
     mapping(uint256 => uint256) internal parentJobIdByCloseJobId; // reverse lookup from close job -> parent job
     mapping(uint256 => uint256) internal activeCloseJobIdByParentJobId; // at most one live close job per parent
+    mapping(uint256 => UnderwritingTypes.SidecarState) internal sidecarStateByJobId;
 
     // -------------------------------------------------------------------------
     // Underwriter registry
@@ -123,7 +112,7 @@ abstract contract UnderwritingWorkflowCore {
     // -------------------------------------------------------------------------
 
     /// @dev Return the stored underwriting commit for a job, if any.
-    function _getCommit(uint256 jobId) internal view returns (UnderwriteCommit memory) {
+    function _getCommit(uint256 jobId) internal view returns (UnderwritingTypes.UnderwriteCommit memory) {
         return commits[jobId];
     }
 
@@ -142,6 +131,28 @@ abstract contract UnderwritingWorkflowCore {
         return activeCloseJobIdByParentJobId[parentJobId];
     }
 
+    /// @dev Return the current sidecar state for a job, or `None` when absent.
+    function _getSidecarState(uint256 jobId) internal view returns (UnderwritingTypes.SidecarState) {
+        return sidecarStateByJobId[jobId];
+    }
+
+    /// @dev Return the settlement identity for a job.
+    function _getSettlementJobId(uint256 jobId) internal view returns (uint256) {
+        if (commitHashByJobId[jobId] == bytes32(0)) return 0;
+
+        UnderwritingTypes.UnderwriteCommit memory commit = commits[jobId];
+        if (commit.parentJobId != 0) {
+            return commit.parentJobId;
+        }
+
+        return jobId;
+    }
+
+    /// @dev Return the underwriter committed for a job.
+    function _getUnderwriter(uint256 jobId) internal view returns (address) {
+        return _requireCommit(jobId).underwriter;
+    }
+
     // -------------------------------------------------------------------------
     // ACP lifecycle workflow helpers
     // -------------------------------------------------------------------------
@@ -150,17 +161,17 @@ abstract contract UnderwritingWorkflowCore {
     ///      only when the referenced parent workflow is ready.
     function _preSetBudgetWorkflow(
         AgenticCommerceHooked acp,
-        address hookAddress,
+        address expectedEvaluator,
         uint256 jobId,
         uint256 amount,
         bytes memory optParams
     ) internal {
         AgenticCommerceHooked.Job memory job = acp.getJob(jobId);
-        UnderwriteCommit memory commit = abi.decode(optParams, (UnderwriteCommit));
+        UnderwritingTypes.UnderwriteCommit memory commit = abi.decode(optParams, (UnderwritingTypes.UnderwriteCommit));
         bytes32 newCommitHash = keccak256(abi.encode(commit));
 
         if (job.provider == address(0)) revert ProviderRequired();
-        if (job.evaluator != hookAddress) revert EvaluatorMismatch();
+        if (job.evaluator != expectedEvaluator) revert EvaluatorMismatch();
 
         // Once a job is committed, only an exact replay of the same
         // `{commit,budget}` pair is allowed.
@@ -186,26 +197,76 @@ abstract contract UnderwritingWorkflowCore {
         commitHashByJobId[jobId] = newCommitHash;
         committedBudgetByJobId[jobId] = amount;
         commits[jobId] = commit;
+        sidecarStateByJobId[jobId] = UnderwritingTypes.SidecarState.Committed;
+    }
+
+    /// @dev Require a committed job to still be in the `Committed` sidecar phase.
+    function _preFundWorkflow(AgenticCommerceHooked acp, uint256 jobId) internal view {
+        UnderwritingTypes.UnderwriteCommit memory commit = _requireCommit(jobId);
+        if (sidecarStateByJobId[jobId] != UnderwritingTypes.SidecarState.Committed) revert InvalidState();
+        if (commit.parentJobId != 0) _assertParentReadyForClose(acp, commit.parentJobId);
+    }
+
+    /// @dev Transition a funded job into `FeeEscrowed`.
+    function _postFundWorkflow(uint256 jobId) internal {
+        if (sidecarStateByJobId[jobId] != UnderwritingTypes.SidecarState.Committed) revert InvalidState();
+        sidecarStateByJobId[jobId] = UnderwritingTypes.SidecarState.FeeEscrowed;
+    }
+
+    /// @dev Mark a fee-funded job as externally protected by the coordinator.
+    function _markProtectedWorkflow(uint256 jobId) internal {
+        _requireCommit(jobId);
+        if (sidecarStateByJobId[jobId] != UnderwritingTypes.SidecarState.FeeEscrowed) revert InvalidState();
+        sidecarStateByJobId[jobId] = UnderwritingTypes.SidecarState.Protected;
+    }
+
+    /// @dev Require a protected job before provider submission.
+    function _preSubmitWorkflow(AgenticCommerceHooked acp, uint256 jobId) internal view {
+        UnderwritingTypes.UnderwriteCommit memory commit = _requireCommit(jobId);
+        if (sidecarStateByJobId[jobId] != UnderwritingTypes.SidecarState.Protected) revert InvalidState();
+        if (commit.parentJobId != 0) _assertParentReadyForClose(acp, commit.parentJobId);
     }
 
     /// @dev Ensure the submitted evidence exactly matches the committed hashes.
-    function _postSubmitWorkflow(uint256 jobId, bytes32 deliverable, bytes memory optParams) internal view {
-        SubmitEvidence memory evidence = abi.decode(optParams, (SubmitEvidence));
-        UnderwriteCommit memory commit = _requireCommit(jobId);
+    function _postSubmitWorkflow(uint256 jobId, bytes32 deliverable, bytes memory optParams) internal {
+        if (sidecarStateByJobId[jobId] != UnderwritingTypes.SidecarState.Protected) revert InvalidState();
+
+        UnderwritingTypes.SubmitEvidence memory evidence = abi.decode(optParams, (UnderwritingTypes.SubmitEvidence));
+        UnderwritingTypes.UnderwriteCommit memory commit = _requireCommit(jobId);
 
         if (deliverable != evidence.bundleHash) revert EvidenceMismatch();
         if (evidence.policyHash != commit.policyHash) revert EvidenceMismatch();
         if (evidence.quoteIdHash != commit.quoteIdHash) revert EvidenceMismatch();
+
+        sidecarStateByJobId[jobId] = UnderwritingTypes.SidecarState.EvidenceSubmitted;
+    }
+
+    /// @dev Require a submitted underwriting job before evaluator completion.
+    function _preDecisionWorkflow(AgenticCommerceHooked acp, uint256 jobId) internal view {
+        UnderwritingTypes.UnderwriteCommit memory commit = _requireCommit(jobId);
+        if (sidecarStateByJobId[jobId] != UnderwritingTypes.SidecarState.EvidenceSubmitted) revert InvalidState();
+        if (commit.parentJobId != 0) _assertParentReadyForClose(acp, commit.parentJobId);
+    }
+
+    /// @dev Allow client-side open rejection, but require submitted evidence
+    ///      for evaluator-driven terminal rejection once the job has progressed.
+    function _preRejectWorkflow(AgenticCommerceHooked acp, uint256 jobId) internal view {
+        AgenticCommerceHooked.Job memory job = acp.getJob(jobId);
+        if (job.status == AgenticCommerceHooked.JobStatus.Open) return;
+        _preDecisionWorkflow(acp, jobId);
     }
 
     /// @dev Advance workflow state after ACP completes an underwritten job.
     function _postCompleteWorkflow(uint256 jobId) internal {
-        UnderwriteCommit memory commit = _requireCommit(jobId);
+        UnderwritingTypes.UnderwriteCommit memory commit = _requireCommit(jobId);
         if (commit.parentJobId == 0 && commit.allowCloseJob) {
             // A successful parent job may now admit one close job.
             awaitingCloseByJobId[jobId] = true;
+            sidecarStateByJobId[jobId] = UnderwritingTypes.SidecarState.AwaitingClose;
             return;
         }
+
+        sidecarStateByJobId[jobId] = UnderwritingTypes.SidecarState.SuccessPendingConfirmation;
 
         if (commit.parentJobId != 0) {
             // A successful close job retires the parent/close linkage.
@@ -214,12 +275,17 @@ abstract contract UnderwritingWorkflowCore {
                 delete activeCloseJobIdByParentJobId[parentJobId];
             }
             delete awaitingCloseByJobId[parentJobId];
+            sidecarStateByJobId[parentJobId] = UnderwritingTypes.SidecarState.SuccessPendingConfirmation;
         }
     }
 
     /// @dev Clear the active close slot when a close job is rejected.
     function _postRejectWorkflow(uint256 jobId) internal {
-        UnderwriteCommit memory commit = commits[jobId];
+        if (commitHashByJobId[jobId] == bytes32(0)) return;
+
+        UnderwritingTypes.UnderwriteCommit memory commit = commits[jobId];
+        sidecarStateByJobId[jobId] = UnderwritingTypes.SidecarState.RejectSettled;
+
         if (commit.parentJobId != 0 && activeCloseJobIdByParentJobId[commit.parentJobId] == jobId) {
             delete activeCloseJobIdByParentJobId[commit.parentJobId];
         }
@@ -235,9 +301,9 @@ abstract contract UnderwritingWorkflowCore {
         AgenticCommerceHooked acp,
         uint256 jobId,
         AgenticCommerceHooked.Job memory job,
-        UnderwriteCommit memory commit
+        UnderwritingTypes.UnderwriteCommit memory commit
     ) internal view {
-        UnderwriteCommit memory parentCommit = commits[commit.parentJobId];
+        UnderwritingTypes.UnderwriteCommit memory parentCommit = commits[commit.parentJobId];
         AgenticCommerceHooked.Job memory parentJob = acp.getJob(commit.parentJobId);
         uint256 activeCloseJobId = activeCloseJobIdByParentJobId[commit.parentJobId];
 
@@ -252,10 +318,20 @@ abstract contract UnderwritingWorkflowCore {
                 || parentJob.hook != job.hook
         ) revert ParentMismatch();
         if (parentCommit.underwriter != commit.underwriter) revert ParentMismatch();
-        if (parentJob.status != AgenticCommerceHooked.JobStatus.Completed || !awaitingCloseByJobId[commit.parentJobId]) {
+        _assertParentReadyForClose(acp, commit.parentJobId);
+        if (activeCloseJobId != 0 && activeCloseJobId != jobId) revert ActiveCloseExists();
+    }
+
+    /// @dev Ensure the parent root job is still eligible for a close stage.
+    function _assertParentReadyForClose(AgenticCommerceHooked acp, uint256 parentJobId) internal view {
+        AgenticCommerceHooked.Job memory parentJob = acp.getJob(parentJobId);
+        if (
+            parentJob.status != AgenticCommerceHooked.JobStatus.Completed
+                || !awaitingCloseByJobId[parentJobId]
+                || sidecarStateByJobId[parentJobId] != UnderwritingTypes.SidecarState.AwaitingClose
+        ) {
             revert ParentNotAwaitingClose();
         }
-        if (activeCloseJobId != 0 && activeCloseJobId != jobId) revert ActiveCloseExists();
     }
 
     /// @dev Lazily clear a parent's active close slot when the recorded close
@@ -275,7 +351,7 @@ abstract contract UnderwritingWorkflowCore {
 
     /// @dev Load a previously locked commit or revert if the job never
     ///      established underwriting terms.
-    function _requireCommit(uint256 jobId) internal view returns (UnderwriteCommit memory) {
+    function _requireCommit(uint256 jobId) internal view returns (UnderwritingTypes.UnderwriteCommit memory) {
         if (commitHashByJobId[jobId] == bytes32(0)) revert CommitNotFound();
         return commits[jobId];
     }
