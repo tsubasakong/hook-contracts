@@ -158,7 +158,7 @@ A two‑phase hook can:
 
 - Example implementation: `contracts/hooks/UnderwritingHook.sol`
 - Uses the standard ACP lifecycle for every job; it does **not** extend the core with a separate open-job entrypoint.
-- Keeps `UnderwritingHook.sol` as the ACP-facing shell and evaluator relay, with `UnderwritingMCUCore.sol` owning the internal underwriting workflow state.
+- Keeps `UnderwritingHook.sol` as the ACP-facing shell and evaluator relay, with `UnderwritingWorkflowCore.sol` owning the internal underwriting workflow state.
 - Stores immutable underwriting commits at `setBudget(...)`, validates submit-time evidence, and relays EIP-712 underwriter decisions through `completeBySig(...)` / `rejectBySig(...)`.
 - Supports both:
   - a single-stage underwritten job, and

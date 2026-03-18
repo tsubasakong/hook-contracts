@@ -5,12 +5,12 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "../AgenticCommerceHooked.sol";
 import "../BaseACPHook.sol";
-import "./UnderwritingMCUCore.sol";
+import "./UnderwritingWorkflowCore.sol";
 
 /**
  * @title UnderwritingHook
  * @notice Experimental underwriting example whose top-level hook acts as the
- *         ACP-facing shell and evaluator relay, while `UnderwritingMCUCore`
+ *         ACP-facing shell and evaluator relay, while `UnderwritingWorkflowCore`
  *         owns the internal underwriting workflow state.
  *
  * USE CASE
@@ -22,27 +22,54 @@ import "./UnderwritingMCUCore.sol";
  * be finalized.
  *
  * The same underwriting mechanism supports both:
- *  - a normal single-stage underwritten job, and
- *  - a two-stage underwritten flow where a parent job, once approved, may
+ *  - a normal single-stage underwritten job (token swap,etc.), and
+ *  - a two-stage underwritten flow (open/close position, Defi yield farming, etc.) where a parent job, once approved, may
  *    later admit one hook-linked close job under the same underwriter.
  *
- * FLOW
+ * FLOW (hook callbacks marked with →)
  * ----
- *  1. Client creates a job with `hook = this` and `evaluator = this`.
- *  2. Client calls `setBudget(jobId, amount, abi.encode(commit))`.
- *     → `_preSetBudget` commits the underwriting payload and locks the budget.
- *  3. Client funds the job through the normal ACP flow.
- *  4. Provider submits `deliverable = evidence.bundleHash` with
- *     `optParams = abi.encode(SubmitEvidence)`.
- *     → `_postSubmit` verifies the submitted evidence matches the committed
- *       policy and quote hashes.
- *  5. The underwriter signs either `CompleteDecision` or `RejectDecision`.
- *  6. Anyone may relay that signature via `completeBySig(...)` or
- *     `rejectBySig(...)`.
- *  7. If the committed job allows a follow-on close stage, `_postComplete`
- *     marks the parent job `AwaitingClose`.
- *  8. A later close job is just another normal ACP `createJob(...)` call whose
- *     committed payload points back to the parent `jobId`.
+ *  1. Hook admin registers an allowed underwriter signer.
+ *  2. Client creates a job with `hook = this` and `evaluator = this`.
+ *  3. Client calls `setBudget(jobId, amount, abi.encode(commit))`:
+ *     → `_preSetBudget`: delegate into `UnderwritingWorkflowCore` to lock the
+ *       committed underwriting terms and classify the job as:
+ *         - `SingleStage`, or
+ *         - `ParentPlusClose` when `allowCloseJob = true`.
+ *  4. Client funds the job through the normal ACP flow.
+ *  5. Provider submits `deliverable = evidence.bundleHash` with
+ *     `optParams = abi.encode(SubmitEvidence)`:
+ *     → `_postSubmit`: verify the submitted bundle, policy, and quote hashes
+ *       against the committed underwriting terms.
+ *  6. The underwriter signs either `CompleteDecision` or `RejectDecision`
+ *     off-chain.
+ *  7. Anyone may relay that signature via `completeBySig(...)` or
+ *     `rejectBySig(...)`:
+ *     → hook shell verifies deadline, nonce, and signer
+ *     → ACP `complete()` or `reject()` finalizes the job.
+ *  8. If the first job was committed with `allowCloseJob = true` and is
+ *     approved:
+ *     → `_postComplete`: mark the parent job `AwaitingClose`.
+ *  9. A later close job is just another normal ACP `createJob(...)` call whose
+ *     committed payload points back to the parent `jobId`:
+ *     → `_preSetBudget`: validate same actors, same underwriter, and parent
+ *       readiness before admitting the close stage.
+ * 10. The close job then follows the same ACP rail:
+ *     `setBudget -> fund -> submit -> completeBySig/rejectBySig`.
+ *
+ * RECOVERY
+ * --------
+ *  - close rejection: `_postReject` clears only the active close linkage so
+ *    the parent may stay `AwaitingClose`.
+ *  - close expiry: `claimRefund()` remains outside the hook surface; the next
+ *    close commit lazily clears the stale close slot if the previous close job
+ *    already reached `Expired`.
+ *
+ * KEY PROPERTY
+ * ------------
+ * ACP remains the generic escrow rail. `UnderwritingHook` is the ACP-facing
+ * shell and evaluator relay, while `UnderwritingWorkflowCore` owns the internal
+ * underwriting workflow state, including commit locking, parent/close linkage,
+ * and close-stage admission rules.
  *
  * TRUST MODEL
  * -----------
@@ -56,7 +83,7 @@ import "./UnderwritingMCUCore.sol";
  * linkage primitives. This example is intentionally labeled
  * experimental rather than production-ready settlement infrastructure.
  */
-contract UnderwritingHook is BaseACPHook, EIP712, UnderwritingMCUCore {
+contract UnderwritingHook is BaseACPHook, EIP712, UnderwritingWorkflowCore {
     bytes32 private constant COMPLETE_TYPEHASH =
         keccak256("CompleteDecision(uint256 jobId,bytes32 reason,uint64 deadline,uint256 nonce)");
     bytes32 private constant REJECT_TYPEHASH =
