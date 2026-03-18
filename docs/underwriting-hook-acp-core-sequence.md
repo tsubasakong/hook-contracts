@@ -18,6 +18,10 @@ stays limited to the contracts that actually exist in `hook-contracts`.
 To keep GitHub rendering readable, this page splits the implementation flow into
 smaller diagrams with fewer lanes and shorter labels.
 
+This implementation-level doc intentionally stops at the current scaffold
+boundary. For the broader sidecar-oriented reviewer deep dive, see
+`docs/underwriting-hook-sidecar-sequence.md`.
+
 ## Implementation-Level Sequence Diagrams
 
 ### 1. Underwriter Setup

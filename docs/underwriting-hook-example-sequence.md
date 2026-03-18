@@ -20,6 +20,9 @@ money movement.
 To keep GitHub rendering readable, this page uses several smaller sequence
 diagrams instead of one large all-in-one chart.
 
+For the broader sidecar-oriented reviewer deep dive, see
+`docs/underwriting-hook-sidecar-sequence.md`.
+
 ## Business-Level Sequence Diagrams
 
 ### 1. Setup
