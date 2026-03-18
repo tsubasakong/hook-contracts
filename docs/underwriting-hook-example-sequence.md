@@ -12,73 +12,41 @@ contracts do today, not to mirror the fuller MCU settlement system in
 - This example does not implement underwriting premium, provider collateral,
   client principal deployment, dispute windows, or settlement sidecars.
 
+To keep GitHub rendering readable, this page uses several smaller sequence
+diagrams instead of one large all-in-one chart.
+
 ## Business-Level Sequence Diagrams
 
-### Single-Stage Job
+### Root Job Request and Funding
 
-`parentJobId = 0`. One ACP job carries request, budget funding, submission, and
-the underwriter decision.
+Applies to both a single-stage job and the first job in a `ParentPlusClose`
+workflow.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Admin
     actor Client
-    actor Provider
-    actor Underwriter
-    participant ACP as ACP / AgenticCommerceHooked
+    participant ACP as ACP
     participant Hook as UnderwritingHook
-    participant Workflow as UnderwritingWorkflowCore
+    participant Flow as WorkflowCore
 
-    Note over Client,Underwriter: Resource model: one ACP job, one underwriting commit, no follow-on close leg
-
-    rect rgb(255, 236, 240)
-        Note over Admin,Underwriter: Phase 0 - Setup
-        Admin->>Hook: registerUnderwriter(underwriter)
-        Hook->>Workflow: admit underwriter for future root commits
-    end
-
-    rect rgb(255, 236, 240)
-        Note over Client,Underwriter: Phase 1 - Request
-        Client->>ACP: createJob(provider, evaluator=Hook, hook=Hook)
-        Client->>ACP: setBudget(jobId, amount, abi.encode(commit))
-        ACP->>Hook: beforeAction(jobId, setBudget, data)
-        Hook->>Workflow: lock the root commit and budget
-        Note over ACP,Workflow: Root commits require a provider, a registered underwriter, and a future validity window
-    end
-
-    rect rgb(255, 236, 240)
-        Note over Client,Underwriter: Phase 2 - Funding
-        Client->>ACP: fund(jobId, amount, "")
-        Note over ACP,Workflow: ACP escrows the normal job budget. No premium or collateral sidecar exists here
-    end
-
-    rect rgb(255, 236, 240)
-        Note over Client,Underwriter: Phase 3 - Submission and Decision
-        Provider->>ACP: submit(jobId, bundleHash, abi.encode(evidence))
-        ACP->>Hook: afterAction(jobId, submit, data)
-        Hook->>Workflow: compare evidence against the locked commit
-        alt underwriter approves
-            Underwriter-->>Client: sign CompleteDecision off-chain
-            Client->>Hook: relay completeBySig(decision, sig)
-            Hook->>ACP: complete(jobId, reason, "")
-            ACP->>Hook: afterAction(jobId, complete, data)
-            Hook->>Workflow: finalize the single-stage workflow
-        else underwriter rejects
-            Underwriter-->>Client: sign RejectDecision off-chain
-            Client->>Hook: relay rejectBySig(decision, sig)
-            Hook->>ACP: reject(jobId, reason, "")
-            ACP->>Hook: afterAction(jobId, reject, data)
-            Hook->>Workflow: finalize the rejected workflow
-        end
-    end
+    Admin->>Hook: registerUnderwriter(underwriter)
+    Hook->>Flow: add underwriter
+    Client->>ACP: createJob(provider, evaluator=Hook, hook=Hook)
+    Client->>ACP: setBudget(jobId, amount, commit)
+    ACP->>Hook: beforeAction(setBudget)
+    Hook->>Flow: lock commit + budget
+    Flow-->>Hook: job admitted
+    Hook-->>ACP: allow setBudget
+    Client->>ACP: fund(jobId, amount)
 ```
 
-### ParentPlusClose Workflow
+### Root Job Submission and Decision
 
-The first approved job sets `AwaitingClose` inside `UnderwritingWorkflowCore`.
-A second ACP job later closes the workflow under the same actors and
-underwriter.
+For readability, the diagrams show the `Client` relaying the underwriter
+signature, although any caller may relay `completeBySig(...)` or
+`rejectBySig(...)`.
 
 ```mermaid
 sequenceDiagram
@@ -86,66 +54,99 @@ sequenceDiagram
     actor Client
     actor Provider
     actor Underwriter
-    participant ACP as ACP / AgenticCommerceHooked
+    participant ACP as ACP
     participant Hook as UnderwritingHook
-    participant Workflow as UnderwritingWorkflowCore
+    participant Flow as WorkflowCore
 
-    Note over Client,Underwriter: Resource model: two ACP jobs. The parent job establishes AwaitingClose and the close job later settles the follow-on stage
-
-    rect rgb(255, 236, 240)
-        Note over Client,Underwriter: Phase 1 - Parent Job
-        Client->>ACP: createJob(provider, evaluator=Hook, hook=Hook)
-        Client->>ACP: setBudget(parentJobId, amount, abi.encode(parentCommit))
-        Note over Client,Workflow: parentCommit sets allowCloseJob = true
-        ACP->>Hook: beforeAction(parentJobId, setBudget, data)
-        Hook->>Workflow: lock the parent commit and budget
-        Client->>ACP: fund(parentJobId, amount, "")
-        Provider->>ACP: submit(parentJobId, bundleHash, abi.encode(parentEvidence))
-        ACP->>Hook: afterAction(parentJobId, submit, data)
-        Hook->>Workflow: compare parent evidence against the locked parent commit
-        Underwriter-->>Client: sign parent CompleteDecision or RejectDecision
-        Client->>Hook: relay parent decision
-        alt parent rejected
-            Hook->>ACP: reject(parentJobId, reason, "")
-            ACP->>Hook: afterAction(parentJobId, reject, data)
-            Hook->>Workflow: end the workflow with no close job
-        else parent approved
-            Hook->>ACP: complete(parentJobId, reason, "")
-            ACP->>Hook: afterAction(parentJobId, complete, data)
-            Hook->>Workflow: mark parent AwaitingClose
-        end
+    Provider->>ACP: submit(jobId, bundleHash, evidence)
+    ACP->>Hook: afterAction(submit)
+    Hook->>Flow: verify evidence
+    alt underwriter approves
+        Underwriter-->>Client: sign CompleteDecision
+        Client->>Hook: completeBySig(...)
+        Hook->>ACP: complete(jobId, reason, "")
+        ACP->>Hook: afterAction(complete)
+        Hook->>Flow: finalize root job
+    else underwriter rejects
+        Underwriter-->>Client: sign RejectDecision
+        Client->>Hook: rejectBySig(...)
+        Hook->>ACP: reject(jobId, reason, "")
+        ACP->>Hook: afterAction(reject)
+        Hook->>Flow: finalize rejected job
     end
+```
 
-    rect rgb(255, 236, 240)
-        Note over Client,Underwriter: Phase 2 - Close Job Admission and Funding
-        Client->>ACP: createJob(provider, evaluator=Hook, hook=Hook)
-        Client->>ACP: setBudget(closeJobId, closeAmount, abi.encode(closeCommit))
-        Note over Client,Workflow: closeCommit points back to parentJobId
-        ACP->>Hook: beforeAction(closeJobId, setBudget, data)
-        Hook->>Workflow: validate parent readiness, same actors, same underwriter, and one active close slot
-        Hook-->>ACP: admit the close job
-        Client->>ACP: fund(closeJobId, closeAmount, "")
-    end
+### Parent Job Approval With `allowCloseJob`
 
-    rect rgb(255, 236, 240)
-        Note over Client,Underwriter: Phase 3 - Close Submission and Outcome
-        Provider->>ACP: submit(closeJobId, closeBundleHash, abi.encode(closeEvidence))
-        ACP->>Hook: afterAction(closeJobId, submit, data)
-        Hook->>Workflow: compare close evidence against the locked close commit
-        Underwriter-->>Client: sign close CompleteDecision or RejectDecision
-        Client->>Hook: relay close decision
-        alt close approved
-            Hook->>ACP: complete(closeJobId, reason, "")
-            ACP->>Hook: afterAction(closeJobId, complete, data)
-            Hook->>Workflow: clear active close linkage and clear AwaitingClose
-        else close rejected
-            Hook->>ACP: reject(closeJobId, reason, "")
-            ACP->>Hook: afterAction(closeJobId, reject, data)
-            Hook->>Workflow: clear the active close only. Parent stays AwaitingClose
-        else close expires
-            Client->>ACP: claimRefund(closeJobId)
-            Note over ACP,Workflow: claimRefund is not hookable. A later close commit can replace the expired close after stale-link cleanup
-        end
+This branch exists only when the first commit sets `allowCloseJob = true`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    actor Underwriter
+    participant ACP as ACP
+    participant Hook as UnderwritingHook
+    participant Flow as WorkflowCore
+
+    Underwriter-->>Client: sign CompleteDecision
+    Client->>Hook: completeBySig(...)
+    Hook->>ACP: complete(parentJobId, reason, "")
+    ACP->>Hook: afterAction(complete)
+    Hook->>Flow: mark parent AwaitingClose
+```
+
+### Close Job Admission and Funding
+
+The close job is a second ACP job that points back to the approved parent job.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant ACP as ACP
+    participant Hook as UnderwritingHook
+    participant Flow as WorkflowCore
+
+    Client->>ACP: createJob(provider, evaluator=Hook, hook=Hook)
+    Client->>ACP: setBudget(closeJobId, closeAmount, closeCommit)
+    ACP->>Hook: beforeAction(setBudget)
+    Hook->>Flow: validate parent + close linkage
+    Flow-->>Hook: close job admitted
+    Hook-->>ACP: allow setBudget
+    Client->>ACP: fund(closeJobId, closeAmount)
+```
+
+### Close Job Submission and Outcome
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    actor Provider
+    actor Underwriter
+    participant ACP as ACP
+    participant Hook as UnderwritingHook
+    participant Flow as WorkflowCore
+
+    Provider->>ACP: submit(closeJobId, closeBundleHash, closeEvidence)
+    ACP->>Hook: afterAction(submit)
+    Hook->>Flow: verify close evidence
+    alt close approved
+        Underwriter-->>Client: sign CompleteDecision
+        Client->>Hook: completeBySig(...)
+        Hook->>ACP: complete(closeJobId, reason, "")
+        ACP->>Hook: afterAction(complete)
+        Hook->>Flow: clear active close and AwaitingClose
+    else close rejected
+        Underwriter-->>Client: sign RejectDecision
+        Client->>Hook: rejectBySig(...)
+        Hook->>ACP: reject(closeJobId, reason, "")
+        ACP->>Hook: afterAction(reject)
+        Hook->>Flow: clear active close only
+    else close expires
+        Client->>ACP: claimRefund(closeJobId)
+        Flow-->>Hook: stale close is cleared on the next close commit
     end
 ```
 
