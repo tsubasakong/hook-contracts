@@ -39,8 +39,25 @@ sequenceDiagram
 
 ### 2. Root Job Request and Fee Funding
 
-Applies to both a single-stage job and the first job in a `ParentPlusClose`
-workflow.
+The `createJob(...)` ACP call is identical for all three job types. **The
+commit payload encoded in `setBudget(...)` is the sole discriminator.** The
+hook decodes the `UnderwriteCommit` struct from the `optParams` and branches
+on two fields:
+
+| Scenario | `parentJobId` | `allowCloseJob` |
+|---|---|---|
+| Single-stage root job | `0` | `false` |
+| Two-stage parent job | `0` | `true` |
+| Close job for existing parent | `!= 0` (parent's jobId) | `false` |
+
+This section covers the first two rows (root jobs). Close-job admission is
+described in §5.
+
+For root jobs (`parentJobId == 0`) the hook validates that the named
+`underwriter` is in the registered allowlist and locks the commit. Whether the
+root job is single-stage or the parent of a two-stage flow only matters later
+at completion time (§4), when `allowCloseJob` determines whether the job
+enters `AwaitingClose` or `SuccessPendingConfirmation`.
 
 ```mermaid
 sequenceDiagram
@@ -52,8 +69,9 @@ sequenceDiagram
 
     Client->>ACP: createJob(provider, evaluator=Evaluator, hook=Hook)
     Client->>ACP: setBudget(jobId, amount, commit)
+    Note over Client: commit.parentJobId == 0
     ACP->>Hook: beforeAction(setBudget)
-    Hook->>Flow: lock commit and budget
+    Hook->>Flow: validate underwriter is registered, lock commit and budget
     Hook-->>ACP: allow setBudget
     Client->>ACP: fund(jobId, amount)
     ACP->>Hook: afterAction(fund)
@@ -87,6 +105,15 @@ sequenceDiagram
 For readability, the diagrams show the `Client` relaying the signature, though
 any caller may relay `completeBySig(...)` or `rejectBySig(...)`.
 
+This is where the `allowCloseJob` flag — committed at `setBudget` time (§2) —
+finally takes effect. `_postCompleteWorkflow` checks `parentJobId == 0 &&
+allowCloseJob`:
+
+- **true** → the root job becomes a two-stage parent and enters
+  `AwaitingClose`, which enables a future close job to reference it (§5).
+- **false** (with `parentJobId == 0`) → single-stage; goes straight to
+  `SuccessPendingConfirmation`.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -101,9 +128,9 @@ sequenceDiagram
     Client->>Eval: completeBySig(...) or rejectBySig(...)
     Eval->>ACP: complete(jobId, ...) or reject(jobId, ...)
     ACP->>Hook: afterAction(complete or reject)
-    alt root approved with allowCloseJob
+    alt approved with allowCloseJob == true (two-stage parent)
         Hook->>Flow: mark AwaitingClose
-    else single-stage approved
+    else approved with allowCloseJob == false (single-stage)
         Hook->>Flow: mark SuccessPendingConfirmation
     else root rejected
         Hook->>Flow: mark RejectSettled
@@ -112,8 +139,18 @@ sequenceDiagram
 
 ### 5. Close Job Admission and Protection
 
-The close job is a second ACP job that points back to the approved parent job.
-If the client rejects that close job while it is still `Open`, the hook clears
+A close job is just another `createJob(...)` → `setBudget(...)` sequence, but
+its commit payload carries `parentJobId != 0` (pointing to the approved parent
+from §4). This triggers the close-job branch of the same
+`_preSetBudgetWorkflow` described in §2. Instead of checking the underwriter
+registry, the hook validates:
+
+- the parent is in `AwaitingClose` state,
+- the actors (client, provider, evaluator, hook) and underwriter match the
+  parent,
+- no other live close job already occupies the parent's active-close slot.
+
+If the client rejects the close job while it is still `Open`, the hook clears
 the reserved close slot and the parent remains `AwaitingClose`.
 
 ```mermaid
@@ -127,8 +164,9 @@ sequenceDiagram
 
     Client->>ACP: createJob(provider, evaluator=Evaluator, hook=Hook)
     Client->>ACP: setBudget(closeJobId, closeAmount, closeCommit)
+    Note over Client: closeCommit.parentJobId != 0
     ACP->>Hook: beforeAction(setBudget)
-    Hook->>Flow: validate parent and close linkage
+    Hook->>Flow: validate parent AwaitingClose, same actors, record linkage
     Hook-->>ACP: admit close job
     Client->>ACP: fund(closeJobId, closeAmount)
     ACP->>Hook: afterAction(fund)

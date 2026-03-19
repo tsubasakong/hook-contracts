@@ -39,7 +39,27 @@ sequenceDiagram
 ### 2. Root Job Commit Lock
 
 The job is first created with `hook = Hook` and `evaluator = Evaluator`. The
-actual underwriting admission still happens on the first `setBudget(...)`.
+`createJob(...)` call is identical for all three job types — **the commit
+payload encoded in `setBudget(...)` is the sole discriminator**.
+
+`_preSetBudgetWorkflow` decodes the `UnderwriteCommit` struct from
+`optParams` and branches on two fields:
+
+| Scenario | `parentJobId` | `allowCloseJob` |
+|---|---|---|
+| Single-stage root job | `0` | `false` |
+| Two-stage parent job | `0` | `true` |
+| Close job for existing parent | `!= 0` (parent's jobId) | `false` |
+
+- **Root jobs** (`parentJobId == 0`): the hook validates that the named
+  `underwriter` is in the registered allowlist, then locks the commit.
+  Whether this root job is single-stage or the parent of a two-stage flow is
+  determined later — `allowCloseJob` only matters at completion time (see §5).
+- **Close jobs** (`parentJobId != 0`): the hook skips the underwriter
+  registry check and instead validates that the parent workflow is in
+  `AwaitingClose`, the actors (client, provider, evaluator, hook) and
+  underwriter match, and no other live close job already occupies the slot.
+  It then records the parent/close linkage.
 
 ```mermaid
 sequenceDiagram
@@ -54,7 +74,14 @@ sequenceDiagram
     Hook->>Flow: _preSetBudgetWorkflow(...)
     Flow->>ACP: getJob(jobId)
     ACP-->>Flow: job metadata
-    Flow-->>Hook: validate provider, evaluator, underwriter, and validUntil
+    alt parentJobId == 0 (root job)
+        Flow-->>Hook: validate underwriter is registered
+    else parentJobId != 0 (close job)
+        Flow->>ACP: getJob(parentJobId)
+        ACP-->>Flow: parent job metadata
+        Flow-->>Hook: validate parent AwaitingClose, same actors, same underwriter
+        Flow-->>Hook: record parent/close linkage
+    end
     Flow-->>Hook: store commit hash, budget, and commit
     Hook-->>ACP: allow setBudget
 ```
@@ -112,6 +139,14 @@ sequenceDiagram
 For readability, this diagram shows the `Client` relaying the signature, though
 any caller may relay `completeBySig(...)` or `rejectBySig(...)`.
 
+This is where the `allowCloseJob` flag — committed at `setBudget` time (§2) —
+finally takes effect. `_postCompleteWorkflow` checks `parentJobId == 0 &&
+allowCloseJob`:
+
+- **true** → the job becomes a two-stage parent and enters `AwaitingClose`.
+- **false** (and `parentJobId == 0`) → single-stage; goes straight to
+  `SuccessPendingConfirmation`.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -132,10 +167,10 @@ sequenceDiagram
     ACP->>Hook: beforeAction(complete or reject)
     Hook->>Flow: _preDecisionWorkflow(...)
     ACP->>Hook: afterAction(complete or reject)
-    alt approved with allowCloseJob
+    alt approved with allowCloseJob (two-stage parent)
         Hook->>Flow: _postCompleteWorkflow(jobId)
         Flow-->>Hook: mark AwaitingClose
-    else approved single-stage
+    else approved without allowCloseJob (single-stage)
         Hook->>Flow: _postCompleteWorkflow(jobId)
         Flow-->>Hook: mark SuccessPendingConfirmation
     else rejected
@@ -146,7 +181,11 @@ sequenceDiagram
 
 ### 6. Close Job Admission
 
-Precondition: `awaitingCloseByJobId[parentJobId] = true`.
+A close job is admitted through the same `setBudget` code path as a root job
+(§2), but it carries `parentJobId != 0` in its commit payload, which triggers
+the close-job branch of `_preSetBudgetWorkflow`. Precondition:
+`awaitingCloseByJobId[parentJobId] = true`.
+
 If the client rejects the close job while it is still `Open`, the hook marks it
 `RejectSettled` and clears the reserved active-close slot.
 
@@ -159,6 +198,7 @@ sequenceDiagram
     participant Flow as WorkflowCore
 
     Client->>ACP: setBudget(closeJobId, closeAmount, closeCommit)
+    Note over Client: closeCommit.parentJobId != 0
     ACP->>Hook: beforeAction(setBudget)
     Hook->>Flow: _preSetBudgetWorkflow(...)
     Flow->>ACP: getJob(closeJobId)
